@@ -30,7 +30,7 @@ Invoke-WebRequest -Uri "https://bridge.annealing.cn/download/thkj-claude-code.tg
   -OutFile "$env:TEMP\lucky-install\thkj-claude-code.tgz"
 
 # 用 node.exe 直接运行 npm-cli.js 安装
-& "D:\nodejs\node.exe" "D:\nodejs\node_modules\npm\bin\npm-cli.js" `
+& "<node_install_dir>\node.exe" "<node_install_dir>\node_modules\npm\bin\npm-cli.js" `
   install --global --prefix "$env:LOCALAPPDATA\Programs\Lucky\channels\stable" `
   --no-audit --no-fund "$env:TEMP\lucky-install\thkj-claude-code.tgz"
 ```
