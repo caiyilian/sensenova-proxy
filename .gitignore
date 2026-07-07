@@ -1,0 +1,16 @@
+# API keys — NEVER commit real keys
+sensenova_apikeys
+
+# Node
+node_modules/
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+.idea/
+.vscode/
