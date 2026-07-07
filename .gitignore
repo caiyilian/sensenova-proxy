@@ -14,3 +14,6 @@ Thumbs.db
 *.swo
 .idea/
 .vscode/
+
+# OpenCode session files
+.omo/
