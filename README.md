@@ -1,9 +1,10 @@
 # SenseNova Proxy
 
-A pair of lightweight local gateways that pool multiple SenseNova API keys:
+Lightweight local gateways for SenseNova and Agnes:
 
 - `sensenova-proxy.js` keeps the original Anthropic Messages API endpoint for Claude Code/Lucky.
 - `opencode-pool-proxy.js` exposes an OpenAI-compatible endpoint for OpenCode, WorkBuddy, and similar clients, with automatic failover and per-model cooldowns.
+- `agnes-proxy.js` exposes an OpenAI-compatible Agnes endpoint with direct/Clash failover, guarded node recovery, and local rate-limit queuing.
 
 ## Why
 
@@ -51,6 +52,7 @@ The gateway:
 - uses a fixed 60-second TPM/RPM cooldown (or a longer server-provided `Retry-After`) instead of exponential backoff;
 - tracks cooldowns separately per model, so a limited model does not unnecessarily disable the same account for other models;
 - waits locally only when every account is cooling down (up to 10 minutes by default);
+- after one request has exhausted the whole pool, spaces later probes by a fixed 5 seconds instead of repeatedly bursting across every account;
 - hot-reloads `sensenova_apikeys` after it changes, without a restart;
 - writes metadata-only JSONL logs to `logs/openai-pool/` and never logs API keys, prompts, or response bodies.
 
@@ -88,11 +90,78 @@ Optional environment variables:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `SENSENOVA_POOL_PORT` | `18787` | Local listening port |
+| `SENSENOVA_POOL_HOST` | `127.0.0.1` | Listening interface; use a LAN address only with firewall controls |
 | `SENSENOVA_POOL_LOCAL_TOKEN` | `local-sensenova-pool` | Credential accepted from local clients |
 | `SENSENOVA_POOL_MAX_QUEUE_MS` | `600000` | Maximum time a request may wait for a cooled-down account |
+| `SENSENOVA_POOL_PROBE_INTERVAL_MS` | `5000` | Fixed spacing between probes after a full-pool failure |
 | `SENSENOVA_POOL_REQUEST_TIMEOUT_MS` | `300000` | Time allowed for upstream response headers |
 | `SENSENOVA_POOL_KEY_FILE` | `sensenova_apikeys` | Alternate key-file path |
 | `SENSENOVA_POOL_LOG_DIR` | `logs/openai-pool` | Alternate JSONL log directory |
+
+## Agnes resilient gateway
+
+The Agnes gateway listens on `127.0.0.1:18788`. It preserves the original OpenAI-compatible request and response format for these models:
+
+- `agnes-2.0-flash`
+- `agnes-2.5-flash`
+- `agnes-3.0-flash`
+
+Its routing policy is deliberately conservative:
+
+1. Use a direct connection while it is healthy.
+2. On a definite DNS/connect failure, retry through the local Clash HTTP proxy at `127.0.0.1:7890`.
+3. If Clash also cannot connect, run `../android-install/tools/clash-node-helper.ps1` once to select a healthy node, then retry through Clash.
+4. Do not change Clash nodes for an Agnes TPM/RPM response. Queue that model locally for 60 seconds (or the server's longer `Retry-After`) and let one request probe first, which avoids a retry stampede.
+5. Do not automatically resend an ambiguous connection failure such as a socket reset after transmission, because Agnes may already be processing it.
+
+The real upstream key is read only from `AGNES_API_KEY`. Clients send the unrelated local token `local-agnes-proxy`, so the upstream key is not stored in OpenCode configuration, task arguments, source code, or logs.
+
+Install and start it:
+
+```powershell
+npm install
+npm run start:agnes
+```
+
+Or register the hidden Windows logon task:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register-agnes-proxy-task.ps1
+```
+
+OpenCode provider settings:
+
+```json
+{
+  "npm": "@ai-sdk/openai-compatible",
+  "name": "Agnes Resilient",
+  "options": {
+    "baseURL": "http://127.0.0.1:18788/v1",
+    "apiKey": "local-agnes-proxy"
+  }
+}
+```
+
+Health information is at `http://127.0.0.1:18788/health`. Metadata-only JSONL logs are written to `logs/agnes-proxy/`; request bodies, responses, and credentials are never logged.
+
+Optional environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AGNES_PROXY_PORT` | `18788` | Listening port |
+| `AGNES_PROXY_HOST` | `127.0.0.1` | Listening interface; use a LAN address only with firewall controls |
+| `AGNES_PROXY_LOCAL_TOKEN` | `local-agnes-proxy` | Credential accepted from local clients |
+| `AGNES_PROXY_CLASH_URL` | `http://127.0.0.1:7890` | Clash HTTP proxy URL |
+| `AGNES_CLASH_RECOVERY_SCRIPT` | sibling `android-install` helper | Alternate node-recovery script path |
+| `AGNES_PROXY_MAX_QUEUE_MS` | `600000` | Maximum local wait for rate limits |
+| `AGNES_PROXY_RATE_COOLDOWN_MS` | `60000` | Minimum fixed rate-limit cooldown |
+| `AGNES_PROXY_LOG_DIR` | `logs/agnes-proxy` | Alternate JSONL log directory |
+
+## LAN deployment
+
+Both OpenAI-compatible gateways can run on an always-on LAN server. Set `SENSENOVA_POOL_HOST` and `AGNES_PROXY_HOST` to the server's LAN address (or `0.0.0.0`), replace the default local tokens with strong random values, and allow the ports only from trusted client IP addresses in the server firewall. Then point clients to `http://SERVER_IP:18787/v1` and `http://SERVER_IP:18788/v1`.
+
+Keep `sensenova_apikeys` and `AGNES_API_KEY` only on the server. The Agnes Clash fallback and automatic node switch must also run on that server: install Clash Verge/mihomo there and place the `android-install` repository beside this one, or set `AGNES_CLASH_RECOVERY_SCRIPT` explicitly. Plain HTTP exposes prompts and responses to anyone able to observe the LAN; use a trusted LAN, a private overlay such as WireGuard/Tailscale, or a TLS reverse proxy when that matters.
 
 ## Usage
 
@@ -169,12 +238,16 @@ The proxy passes the model name through to SenseNova as-is. Any model available 
 | `opencode-pool-proxy.js` | OpenAI-compatible failover gateway (port 18787) |
 | `lib/openai-pool.js` | Key reload, scheduling, cooldown, retry, streaming, and logging logic |
 | `scripts/register-opencode-pool-task.ps1` | Register/start the Windows logon task |
+| `agnes-proxy.js` | Agnes direct/Clash resilient gateway (port 18788) |
+| `lib/agnes-gateway.js` | Agnes routing, guarded retry, streaming, and safe logging logic |
+| `lib/clash-recovery.js` | Bounded invocation of the existing Clash node helper |
+| `scripts/register-agnes-proxy-task.ps1` | Register/start the Agnes Windows logon task |
 | `sensenova_apikeys` | **Your real API keys (gitignored)** |
 | `sensenova_apikeys.example` | Example key file template |
 
 ## Requirements
 
-- Node.js 18+
+- Node.js 18.17+
 - SenseNova API key(s) from [platform.sensenova.cn](https://platform.sensenova.cn)
 
 ## License

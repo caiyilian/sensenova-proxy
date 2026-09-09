@@ -38,6 +38,7 @@ const gateway = createGateway({
   localToken: process.env.SENSENOVA_POOL_LOCAL_TOKEN || 'local-sensenova-pool',
   upstreamBaseURL: process.env.SENSENOVA_POOL_UPSTREAM || 'https://token.sensenova.cn/v1',
   maxQueueMs: envInteger('SENSENOVA_POOL_MAX_QUEUE_MS', 10 * 60_000),
+  postSweepProbeIntervalMs: envInteger('SENSENOVA_POOL_PROBE_INTERVAL_MS', 5_000),
   requestTimeoutMs: envInteger('SENSENOVA_POOL_REQUEST_TIMEOUT_MS', 5 * 60_000),
   models: MODELS,
 });

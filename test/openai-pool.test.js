@@ -142,6 +142,66 @@ test('gateway retries a rate-limited key and streams only the successful respons
   assert.equal(events.some((event) => event.event === 'request_succeeded'), true);
 });
 
+test('gateway paces retries after a request has exhausted the whole pool', async (t) => {
+  const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sensenova-pool-pacing-'));
+  const keyFilePath = path.join(temporaryDir, 'keys');
+  fs.writeFileSync(keyFilePath, 'sk-first\nsk-second\n', 'utf8');
+  const attemptTimes = [];
+
+  const fetchImpl = async () => {
+    attemptTimes.push(Date.now());
+    if (attemptTimes.length < 4) {
+      return new Response(JSON.stringify({ error: { message: 'inference exceeds tpm/rpm limit' } }), {
+        status: 429,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'OK' } }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  const gateway = createGateway({
+    keyFilePath,
+    logDir: path.join(temporaryDir, 'logs'),
+    localToken: 'test-token',
+    maxQueueMs: 1_000,
+    requestTimeoutMs: 2_000,
+    postSweepProbeIntervalMs: 30,
+    poolOptions: {
+      cooldowns: {
+        rate_limit: { baseMs: 1, maxMs: 1, exponential: false },
+      },
+    },
+    fetchImpl,
+    logger: () => {},
+  });
+  const gatewayAddress = await gateway.listen(0);
+
+  t.after(async () => {
+    await gateway.close();
+    fs.rmSync(temporaryDir, { recursive: true, force: true });
+  });
+
+  const response = await fetch(
+    `http://127.0.0.1:${gatewayAddress.port}/v1/chat/completions`,
+    {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer test-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [] }),
+    },
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(attemptTimes.length, 4);
+  assert.equal(attemptTimes[3] - attemptTimes[2] >= 20, true);
+  assert.equal(gateway.stats.pacedProbes >= 1, true);
+});
+
 test('health endpoint hot-reloads the key file without revealing keys', async (t) => {
   const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sensenova-pool-health-'));
   const keyFilePath = path.join(temporaryDir, 'keys');
