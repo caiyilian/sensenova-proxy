@@ -5,6 +5,9 @@ sensenova_apikeys
 node_modules/
 npm-debug.log*
 
+# Runtime logs
+logs/
+
 # OS
 .DS_Store
 Thumbs.db
