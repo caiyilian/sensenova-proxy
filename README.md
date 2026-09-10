@@ -6,6 +6,7 @@ Lightweight local gateways for SenseNova and Agnes:
 - `opencode-pool-proxy.js` exposes an OpenAI-compatible endpoint for OpenCode, WorkBuddy, and similar clients, with automatic failover and per-model cooldowns.
 - `agnes-proxy.js` exposes an OpenAI-compatible Agnes endpoint with direct/Clash failover, guarded node recovery, and local rate-limit queuing.
 - `desktop/sensenova-pool/` contains the standalone Windows tray application for sharing the SenseNova pool with users who do not have Node.js installed.
+- `desktop/agnes-proxy/` contains a separate Windows tray controller that runs the tested Agnes gateway in the background without a terminal window.
 
 ## Why
 

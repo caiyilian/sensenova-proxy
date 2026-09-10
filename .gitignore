@@ -14,6 +14,8 @@ logs/
 # Native desktop build output
 desktop/sensenova-pool/dist/
 desktop/sensenova-pool/rsrc.syso
+desktop/agnes-proxy/dist/
+desktop/agnes-proxy/rsrc.syso
 
 # OS
 .DS_Store
