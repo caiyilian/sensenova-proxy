@@ -123,25 +123,32 @@ func NewGateway(
 	}, nil
 }
 
-func (gateway *Gateway) Start(port int) error {
-	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+func (gateway *Gateway) Start(bindHost string, port int) error {
+	if strings.TrimSpace(bindHost) == "" {
+		bindHost = "127.0.0.1"
+	}
+	listener, err := net.Listen("tcp4", net.JoinHostPort(bindHost, strconv.Itoa(port)))
 	if err != nil {
-		return fmt.Errorf("listen on port %d: %w", port, err)
+		return fmt.Errorf("listen on %s port %d: %w", bindHost, port, err)
 	}
 	server := &http.Server{
 		Handler:           gateway,
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
+	actualPort := listener.Addr().(*net.TCPAddr).Port
 	gateway.mu.Lock()
 	gateway.listener = listener
 	gateway.server = server
-	gateway.address = "http://" + listener.Addr().String()
+	// Address is deliberately loopback-safe even when the listener accepts LAN
+	// traffic. It is used by local health checks and tests.
+	gateway.address = fmt.Sprintf("http://127.0.0.1:%d", actualPort)
 	gateway.startedAt = time.Now()
 	gateway.mu.Unlock()
 	gateway.logger.Log("gateway_started", map[string]any{
-		"address": gateway.address,
-		"models":  len(supportedModels),
+		"bindHost": bindHost,
+		"port":     actualPort,
+		"models":   len(supportedModels),
 	})
 	go func() {
 		if serveErr := server.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
@@ -151,10 +158,35 @@ func (gateway *Gateway) Start(port int) error {
 	return nil
 }
 
-func (gateway *Gateway) Close(ctx context.Context) error {
+func (gateway *Gateway) Restart(bindHost string, port int) error {
 	gateway.mu.RLock()
 	server := gateway.server
 	gateway.mu.RUnlock()
+	if server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := server.Shutdown(ctx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("stop current listener: %w", err)
+		}
+		gateway.mu.Lock()
+		if gateway.server == server {
+			gateway.server = nil
+			gateway.listener = nil
+			gateway.address = ""
+		}
+		gateway.mu.Unlock()
+	}
+	return gateway.Start(bindHost, port)
+}
+
+func (gateway *Gateway) Close(ctx context.Context) error {
+	gateway.mu.Lock()
+	server := gateway.server
+	gateway.server = nil
+	gateway.listener = nil
+	gateway.address = ""
+	gateway.mu.Unlock()
 	if server == nil {
 		return nil
 	}

@@ -65,7 +65,7 @@ func TestGatewayRetriesAnotherAccountWithoutLoggingSecrets(t *testing.T) {
 	upstreamURL, _ := url.Parse(upstream.URL + "/v1/")
 	gateway.upstreamBase = upstreamURL
 	gateway.client = upstream.Client()
-	if err := gateway.Start(0); err != nil {
+	if err := gateway.Start("127.0.0.1", 0); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {

@@ -35,13 +35,16 @@ type DesktopUI struct {
 	keyPathEdit      *walk.LineEdit
 	openKeyButton    *walk.PushButton
 	baseURLEdit      *walk.LineEdit
+	lanURLEdit       *walk.LineEdit
 	localTokenEdit   *walk.LineEdit
 	logPathEdit      *walk.LineEdit
 	autoStartCheck   *walk.CheckBox
+	allowLANCheck    *walk.CheckBox
 
 	gatewayStartError error
 	exiting           bool
 	autoStartUpdating bool
+	allowLANUpdating  bool
 	refreshStop       chan struct{}
 	refreshDone       chan struct{}
 	refreshMu         sync.Mutex
@@ -68,6 +71,7 @@ func NewDesktopUI(
 		gateway:           gateway,
 		logger:            logger,
 		gatewayStartError: gatewayStartError,
+		allowLANUpdating:  true,
 		refreshStop:       make(chan struct{}),
 		refreshDone:       make(chan struct{}),
 	}
@@ -85,8 +89,8 @@ func (ui *DesktopUI) Run(startHidden bool) error {
 		Title:    appName,
 		Icon:     icon,
 		Visible:  false,
-		MinSize:  d.Size{Width: 720, Height: 500},
-		Size:     d.Size{Width: max(ui.settings.WindowWidth, 760), Height: max(ui.settings.WindowHeight, 540)},
+		MinSize:  d.Size{Width: 740, Height: 600},
+		Size:     d.Size{Width: max(ui.settings.WindowWidth, 790), Height: max(ui.settings.WindowHeight, 650)},
 		Layout: d.VBox{
 			Margins: d.Margins{Left: 16, Top: 14, Right: 16, Bottom: 14},
 			Spacing: 10,
@@ -134,18 +138,41 @@ func (ui *DesktopUI) Run(startHidden bool) error {
 				Title:  "客户端连接信息",
 				Layout: d.Grid{Columns: 3, Margins: d.Margins{Left: 10, Top: 8, Right: 10, Bottom: 9}, Spacing: 7},
 				Children: []d.Widget{
-					d.Label{Text: "Base URL"},
+					d.Label{Text: "本机 Base URL"},
 					d.LineEdit{AssignTo: &ui.baseURLEdit, ReadOnly: true, ColumnSpan: 1, StretchFactor: 1},
 					d.PushButton{Text: "复制", MinSize: d.Size{Width: 62}, OnClicked: func() { ui.copyText(ui.baseURLEdit.Text(), "Base URL") }},
+					d.Label{Text: "局域网 Base URL"},
+					d.LineEdit{AssignTo: &ui.lanURLEdit, ReadOnly: true, ColumnSpan: 1, StretchFactor: 1},
+					d.PushButton{Text: "复制", MinSize: d.Size{Width: 62}, OnClicked: func() { ui.copyText(ui.lanURLEdit.Text(), "局域网 Base URL") }},
 					d.Label{Text: "本地 API Key"},
 					d.LineEdit{AssignTo: &ui.localTokenEdit, ReadOnly: true, ColumnSpan: 1, StretchFactor: 1},
 					d.PushButton{Text: "复制", MinSize: d.Size{Width: 62}, OnClicked: func() { ui.copyText(ui.localTokenEdit.Text(), "本地 API Key") }},
+					d.Label{Text: "OpenCode 配置"},
+					d.Composite{
+						ColumnSpan:    2,
+						Layout:        d.HBox{MarginsZero: true, Spacing: 7},
+						StretchFactor: 1,
+						Children: []d.Widget{
+							d.PushButton{Text: "同步到本机 OpenCode", MinSize: d.Size{Width: 152}, OnClicked: ui.syncLocalOpenCode},
+							d.HSpacer{},
+						},
+					},
 				},
 			},
 			d.GroupBox{
 				Title:  "程序设置",
 				Layout: d.VBox{Margins: d.Margins{Left: 10, Top: 8, Right: 10, Bottom: 9}, Spacing: 7},
 				Children: []d.Widget{
+					d.CheckBox{
+						AssignTo:         &ui.allowLANCheck,
+						Text:             "允许局域网访问（仅在可信局域网中开启；切换后代理会自动重新监听）",
+						Checked:          ui.settings.AllowLAN,
+						OnCheckedChanged: ui.allowLANChanged,
+					},
+					d.Label{
+						Text:      "若远端仍连接超时，请检查 Windows 防火墙；已有的“阻止”规则会覆盖允许规则。",
+						TextColor: walk.RGB(95, 99, 104),
+					},
 					d.CheckBox{
 						AssignTo:         &ui.autoStartCheck,
 						Text:             "开机自动启动（自动启动时直接最小化到托盘）",
@@ -177,6 +204,7 @@ func (ui *DesktopUI) Run(startHidden bool) error {
 	if err := window.Create(); err != nil {
 		return err
 	}
+	ui.allowLANUpdating = false
 	ui.mainWindow.Closing().Attach(ui.windowClosing)
 	if err := ui.createTrayIcon(); err != nil {
 		ui.mainWindow.Dispose()
@@ -331,6 +359,67 @@ func (ui *DesktopUI) autoStartChanged() {
 	ui.logger.Log("autostart_changed", map[string]any{"enabled": enabled})
 }
 
+func (ui *DesktopUI) allowLANChanged() {
+	if ui.allowLANUpdating {
+		return
+	}
+	desired := ui.allowLANCheck.Checked()
+	previous := ui.settings.AllowLAN
+	if desired == previous {
+		return
+	}
+	if err := ui.gateway.Restart(gatewayBindHost(desired), ui.settings.Port); err != nil {
+		fallbackErr := ui.gateway.Restart(gatewayBindHost(previous), ui.settings.Port)
+		ui.allowLANUpdating = true
+		ui.allowLANCheck.SetChecked(previous)
+		ui.allowLANUpdating = false
+		message := "无法切换局域网监听：\n" + redactText(err.Error())
+		if fallbackErr != nil {
+			ui.gatewayStartError = fallbackErr
+			message += "\n恢复原监听也失败：\n" + redactText(fallbackErr.Error())
+		}
+		walk.MsgBox(ui.mainWindow, appName, message, walk.MsgBoxIconError)
+		ui.refreshUI()
+		return
+	}
+	ui.settings.AllowLAN = desired
+	if err := saveSettings(ui.paths, ui.settings); err != nil {
+		_ = ui.gateway.Restart(gatewayBindHost(previous), ui.settings.Port)
+		ui.settings.AllowLAN = previous
+		ui.allowLANUpdating = true
+		ui.allowLANCheck.SetChecked(previous)
+		ui.allowLANUpdating = false
+		walk.MsgBox(ui.mainWindow, appName, "代理已经切换，但无法保存设置，已恢复原状态：\n"+redactText(err.Error()), walk.MsgBoxIconError)
+		ui.refreshUI()
+		return
+	}
+	ui.gatewayStartError = nil
+	ui.logger.Log("lan_access_changed", map[string]any{"enabled": desired})
+	ui.refreshUI()
+}
+
+func (ui *DesktopUI) syncLocalOpenCode() {
+	path, err := defaultOpenCodeConfigPath()
+	if err != nil {
+		walk.MsgBox(ui.mainWindow, appName, "无法确定 OpenCode 配置位置：\n"+redactText(err.Error()), walk.MsgBoxIconError)
+		return
+	}
+	backup, err := syncOpenCodeConfig(path, localBaseURL(ui.settings.Port), ui.settings.LocalToken)
+	if err != nil {
+		walk.MsgBox(ui.mainWindow, appName, "同步 OpenCode 配置失败：\n"+redactText(err.Error()), walk.MsgBoxIconError)
+		return
+	}
+	ui.logger.Log("opencode_config_synced", map[string]any{
+		"created": backup == "",
+	})
+	message := "已同步本机 OpenCode 配置：\n" + path
+	if backup != "" {
+		message += "\n\n修改前的配置已备份到：\n" + backup
+	}
+	message += "\n\n如果 OpenCode 已经打开，请重新启动一次 OpenCode。"
+	walk.MsgBox(ui.mainWindow, appName, message, walk.MsgBoxIconInformation)
+}
+
 func (ui *DesktopUI) copyText(text, label string) {
 	if err := walk.Clipboard().SetText(text); err != nil {
 		walk.MsgBox(ui.mainWindow, appName, "复制失败：\n"+redactText(err.Error()), walk.MsgBoxIconError)
@@ -430,6 +519,12 @@ func (ui *DesktopUI) refreshUI() {
 	}
 	baseURL := strings.TrimSuffix(address, "/") + "/v1"
 	ui.baseURLEdit.SetText(baseURL)
+	lanURL, lanErr := lanBaseURL(ui.settings.Port)
+	if lanErr != nil {
+		ui.lanURLEdit.SetText("未检测到局域网 IPv4 地址")
+	} else {
+		ui.lanURLEdit.SetText(lanURL)
+	}
 	ui.localTokenEdit.SetText(ui.settings.LocalToken)
 	ui.logPathEdit.SetText(ui.paths.LogDir)
 
@@ -437,7 +532,11 @@ func (ui *DesktopUI) refreshUI() {
 		ui.proxyStatusLabel.SetText("代理服务：启动失败 · " + redactText(ui.gatewayStartError.Error()))
 		ui.proxyStatusLabel.SetTextColor(walk.RGB(190, 48, 48))
 	} else {
-		ui.proxyStatusLabel.SetText("代理服务：运行中 · " + baseURL)
+		listenScope := "仅本机"
+		if ui.settings.AllowLAN {
+			listenScope = "本机与局域网"
+		}
+		ui.proxyStatusLabel.SetText("代理服务：运行中 · " + listenScope + " · " + baseURL)
 		ui.proxyStatusLabel.SetTextColor(walk.RGB(25, 126, 65))
 	}
 

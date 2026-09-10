@@ -13,11 +13,14 @@ import (
 var version = "dev"
 
 type commandLineOptions struct {
-	autoStart bool
-	hidden    bool
-	dataDir   string
-	keyFile   string
-	port      int
+	autoStart    bool
+	hidden       bool
+	allowLAN     bool
+	localOnly    bool
+	syncOpenCode bool
+	dataDir      string
+	keyFile      string
+	port         int
 }
 
 func main() {
@@ -32,6 +35,9 @@ func parseCommandLine() commandLineOptions {
 	options := commandLineOptions{port: -1}
 	flag.BoolVar(&options.autoStart, "autostart", false, "start hidden from the current-user startup entry")
 	flag.BoolVar(&options.hidden, "hidden", false, "start hidden in the notification area")
+	flag.BoolVar(&options.allowLAN, "allow-lan", false, "allow clients on the local network")
+	flag.BoolVar(&options.localOnly, "local-only", false, "listen on loopback only")
+	flag.BoolVar(&options.syncOpenCode, "sync-opencode", false, "synchronize the current local token to the user's OpenCode config")
 	flag.StringVar(&options.dataDir, "data-dir", "", "override the settings and log directory")
 	flag.StringVar(&options.keyFile, "key-file", "", "override the API key file")
 	flag.IntVar(&options.port, "port", -1, "override the local listening port")
@@ -67,6 +73,15 @@ func runApplication(options commandLineOptions) error {
 	if options.keyFile != "" {
 		settings.KeyFilePath = options.keyFile
 	}
+	if options.allowLAN && options.localOnly {
+		return fmt.Errorf("allow-lan and local-only cannot be used together")
+	}
+	if options.allowLAN {
+		settings.AllowLAN = true
+	}
+	if options.localOnly {
+		settings.AllowLAN = false
+	}
 	if err := saveSettings(paths, settings); err != nil {
 		return err
 	}
@@ -80,7 +95,22 @@ func runApplication(options commandLineOptions) error {
 		"autostart": options.autoStart,
 		"hidden":    options.hidden,
 		"port":      settings.Port,
+		"allowLAN":  settings.AllowLAN,
 	})
+	if options.syncOpenCode {
+		configPath, pathErr := defaultOpenCodeConfigPath()
+		if pathErr != nil {
+			return pathErr
+		}
+		backupPath, syncErr := syncOpenCodeConfig(configPath, localBaseURL(settings.Port), settings.LocalToken)
+		if syncErr != nil {
+			return syncErr
+		}
+		logger.Log("opencode_config_synced", map[string]any{
+			"created": backupPath == "",
+			"source":  "command_line",
+		})
+	}
 
 	keyStore := NewKeyStore(settings.KeyFilePath, logger, time.Second)
 	keyStore.Start()
@@ -96,7 +126,7 @@ func runApplication(options commandLineOptions) error {
 	if err != nil {
 		return err
 	}
-	gatewayStartError := gateway.Start(settings.Port)
+	gatewayStartError := gateway.Start(gatewayBindHost(settings.AllowLAN), settings.Port)
 	defer func() {
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()

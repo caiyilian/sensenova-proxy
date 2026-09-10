@@ -21,6 +21,7 @@ type Settings struct {
 	KeyFilePath  string `json:"keyFilePath"`
 	Port         int    `json:"port"`
 	LocalToken   string `json:"localToken"`
+	AllowLAN     bool   `json:"allowLAN"`
 	WindowWidth  int    `json:"windowWidth,omitempty"`
 	WindowHeight int    `json:"windowHeight,omitempty"`
 }
