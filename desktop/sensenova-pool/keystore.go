@@ -145,7 +145,7 @@ func (store *KeyStore) Reload(reason string) KeySnapshot {
 	store.mu.RUnlock()
 
 	if keyPath == "" {
-		return store.setReadError(reason, "尚未选择 API Key 文件")
+		return store.Snapshot()
 	}
 	data, err := os.ReadFile(keyPath)
 	if err != nil {

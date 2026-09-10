@@ -31,6 +31,7 @@ type DesktopUI struct {
 	networkLabel     *walk.Label
 	keyCountLabel    *walk.Label
 	lastReloadLabel  *walk.Label
+	keyHintLabel     *walk.Label
 	keyPathEdit      *walk.LineEdit
 	openKeyButton    *walk.PushButton
 	baseURLEdit      *walk.LineEdit
@@ -72,7 +73,7 @@ func NewDesktopUI(
 	}
 }
 
-func (ui *DesktopUI) Run(startHidden, promptForKeyFile bool) error {
+func (ui *DesktopUI) Run(startHidden bool) error {
 	icon, err := createApplicationIcon()
 	if err != nil {
 		return fmt.Errorf("create application icon: %w", err)
@@ -90,6 +91,7 @@ func (ui *DesktopUI) Run(startHidden, promptForKeyFile bool) error {
 			Margins: d.Margins{Left: 16, Top: 14, Right: 16, Bottom: 14},
 			Spacing: 10,
 		},
+		OnDropFiles: ui.dropKeyFiles,
 		Children: []d.Widget{
 			d.Label{
 				Text: "SenseNova 多账号轮询代理",
@@ -112,15 +114,20 @@ func (ui *DesktopUI) Run(startHidden, promptForKeyFile bool) error {
 				Title:  "API Key 文件",
 				Layout: d.VBox{Margins: d.Margins{Left: 10, Top: 8, Right: 10, Bottom: 9}, Spacing: 7},
 				Children: []d.Widget{
+					d.Label{
+						AssignTo:  &ui.keyHintLabel,
+						Text:      "尚未选择 API Key 文件。请点击“选择任意文件…”或把文件拖到此窗口。",
+						TextColor: walk.RGB(190, 103, 0),
+					},
 					d.Composite{
 						Layout: d.HBox{MarginsZero: true, Spacing: 7},
 						Children: []d.Widget{
 							d.LineEdit{AssignTo: &ui.keyPathEdit, ReadOnly: true, StretchFactor: 1},
-							d.PushButton{Text: "选择文件…", MinSize: d.Size{Width: 92}, OnClicked: ui.chooseKeyFile},
+							d.PushButton{Text: "选择任意文件…", MinSize: d.Size{Width: 108}, OnClicked: ui.chooseKeyFile},
 							d.PushButton{AssignTo: &ui.openKeyButton, Text: "打开文件", MinSize: d.Size{Width: 82}, OnClicked: ui.openKeyFile},
 						},
 					},
-					d.Label{Text: "每行一个 API Key。外部编辑并保存后约 1 秒自动重载；完整密钥不会写入日志。"},
+					d.Label{Text: "文件扩展名不限；内容仍为每行一个 API Key。外部保存后约 1 秒自动重载。"},
 				},
 			},
 			d.GroupBox{
@@ -184,11 +191,6 @@ func (ui *DesktopUI) Run(startHidden, promptForKeyFile bool) error {
 	} else {
 		ui.showWindow()
 	}
-	if promptForKeyFile || !keyConfigured {
-		ui.showWindow()
-		ui.chooseKeyFile()
-	}
-
 	ui.mainWindow.Run()
 	ui.stopRefreshLoop()
 	return nil
@@ -246,7 +248,7 @@ func (ui *DesktopUI) createTrayIcon() error {
 func (ui *DesktopUI) chooseKeyFile() {
 	dialog := walk.FileDialog{
 		Title:  "选择 SenseNova API Key 文件",
-		Filter: "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*",
+		Filter: "所有文件 (*)|*",
 	}
 	if ui.settings.KeyFilePath != "" {
 		dialog.FilePath = ui.settings.KeyFilePath
@@ -260,14 +262,37 @@ func (ui *DesktopUI) chooseKeyFile() {
 	if !accepted {
 		return
 	}
-	if err := ui.keyStore.SetPath(dialog.FilePath); err != nil {
+	ui.useKeyFile(dialog.FilePath, "file_dialog")
+}
+
+func (ui *DesktopUI) dropKeyFiles(files []string) {
+	if len(files) == 0 {
+		return
+	}
+	if len(files) > 1 && ui.notifyIcon != nil {
+		_ = ui.notifyIcon.ShowWarning(appName, "一次只能使用一个 API Key 文件，已选择拖入的第一个文件。")
+	}
+	ui.useKeyFile(files[0], "drag_drop")
+}
+
+func (ui *DesktopUI) useKeyFile(path, source string) {
+	normalized, err := normalizeKeyFilePath(path)
+	if err != nil {
+		walk.MsgBox(ui.mainWindow, appName, "无法使用该文件：\n"+redactText(err.Error()), walk.MsgBoxIconError)
+		return
+	}
+	if err := ui.keyStore.SetPath(normalized); err != nil {
 		walk.MsgBox(ui.mainWindow, appName, "无法加载该文件：\n"+redactText(err.Error()), walk.MsgBoxIconError)
 		return
 	}
-	ui.settings.KeyFilePath = dialog.FilePath
+	ui.settings.KeyFilePath = normalized
 	if err := saveSettings(ui.paths, ui.settings); err != nil {
 		walk.MsgBox(ui.mainWindow, appName, "密钥文件已加载，但无法保存设置：\n"+redactText(err.Error()), walk.MsgBoxIconWarning)
 	}
+	ui.logger.Log("key_file_selected", map[string]any{
+		"source":   source,
+		"fileName": filepath.Base(normalized),
+	})
 	ui.refreshUI()
 }
 
@@ -443,6 +468,11 @@ func (ui *DesktopUI) refreshUI() {
 	pathText := keys.Path
 	if pathText == "" {
 		pathText = "尚未选择"
+		ui.keyHintLabel.SetText("尚未选择 API Key 文件。请点击“选择任意文件…”或把文件拖到此窗口。")
+		ui.keyHintLabel.SetTextColor(walk.RGB(190, 103, 0))
+	} else {
+		ui.keyHintLabel.SetText("正在使用此文件；也可以把另一个文件拖到窗口中进行更换。")
+		ui.keyHintLabel.SetTextColor(walk.RGB(25, 126, 65))
 	}
 	ui.keyPathEdit.SetText(pathText)
 	ui.openKeyButton.SetEnabled(keys.Path != "")
@@ -464,6 +494,25 @@ func (ui *DesktopUI) refreshUI() {
 		}
 		_ = ui.notifyIcon.SetToolTip(status)
 	}
+}
+
+func normalizeKeyFilePath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("文件路径为空")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("解析文件路径：%w", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("读取文件：%w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("拖入的是文件夹，请选择一个 API Key 文件")
+	}
+	return abs, nil
 }
 
 func openPath(path string) error {

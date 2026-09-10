@@ -54,7 +54,7 @@ func runApplication(options commandLineOptions) error {
 	if err != nil {
 		return err
 	}
-	settings, firstRun, err := loadSettings(paths)
+	settings, _, err := loadSettings(paths)
 	if err != nil {
 		return err
 	}
@@ -106,7 +106,7 @@ func runApplication(options commandLineOptions) error {
 	ui := NewDesktopUI(paths, settings, keyStore, pool, network, gateway, logger, gatewayStartError)
 	defer ui.Dispose()
 	startHidden := options.autoStart || options.hidden
-	if err := ui.Run(startHidden, firstRun && settings.KeyFilePath == ""); err != nil {
+	if err := ui.Run(startHidden); err != nil {
 		return fmt.Errorf("create desktop window: %w", err)
 	}
 	logger.Log("application_stopped", map[string]any{})
