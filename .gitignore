@@ -1,6 +1,9 @@
 # API keys — NEVER commit real keys
 sensenova_apikeys
 
+# Machine-specific client config (contains local gateway credentials)
+_局域网服务器的opencode配置文件.json
+
 # Node
 node_modules/
 npm-debug.log*
