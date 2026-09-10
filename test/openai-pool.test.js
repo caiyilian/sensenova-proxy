@@ -13,9 +13,33 @@ const {
   classifyFailure,
   createGateway,
   parseKeyFile,
+  parseKeyFileDetailed,
   parseRetryAfterMs,
   redactError,
+  validateSenseNovaApiKey,
 } = require('../lib/openai-pool');
+
+const KEY_ONE = `sk-${'a'.repeat(32)}`;
+const KEY_TWO = `sk-${'b'.repeat(32)}`;
+const KEY_THREE = `sk-${'c'.repeat(32)}`;
+
+function waitFor(predicate, timeoutMs = 2_000) {
+  const startedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (predicate()) {
+        resolve();
+        return;
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        reject(new Error('Timed out waiting for condition'));
+        return;
+      }
+      setTimeout(check, 10);
+    };
+    check();
+  });
+}
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -38,6 +62,29 @@ test('parseKeyFile ignores comments, blanks, and duplicates', () => {
     parseKeyFile('\uFEFF# private keys\n sk-one \n\n sk-two\nsk-one\n'),
     ['sk-one', 'sk-two'],
   );
+});
+
+test('SenseNova key parsing reports malformed and duplicate lines without exposing values', () => {
+  assert.equal(validateSenseNovaApiKey(KEY_ONE), null);
+  assert.equal(validateSenseNovaApiKey('not-a-key'), 'missing_sk_prefix');
+  assert.equal(validateSenseNovaApiKey('sk-too-short'), 'unexpected_length_12');
+
+  const parsed = parseKeyFileDetailed([
+    '# private keys',
+    KEY_ONE,
+    'not-a-key',
+    KEY_ONE,
+    '',
+  ].join('\n'));
+  assert.deepEqual(parsed.entries, [{ apiKey: KEY_ONE, lineNumber: 2 }]);
+  assert.deepEqual(parsed.invalidLines, [{ lineNumber: 3, reason: 'missing_sk_prefix' }]);
+  assert.deepEqual(parsed.duplicateLines, [{ lineNumber: 4, duplicateOfLine: 2 }]);
+  const metadata = JSON.stringify({
+    invalidLines: parsed.invalidLines,
+    duplicateLines: parsed.duplicateLines,
+  });
+  assert.equal(metadata.includes(KEY_ONE), false);
+  assert.equal(metadata.includes('not-a-key'), false);
 });
 
 test('classifyFailure recognizes SenseNova retryable failures', () => {
@@ -75,7 +122,7 @@ test('TPM/RPM cooldown stays fixed instead of growing exponentially', () => {
 test('gateway retries a rate-limited key and streams only the successful response', async (t) => {
   const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sensenova-pool-test-'));
   const keyFilePath = path.join(temporaryDir, 'keys');
-  fs.writeFileSync(keyFilePath, 'sk-first\nsk-second\n', 'utf8');
+  fs.writeFileSync(keyFilePath, `${KEY_ONE}\n${KEY_TWO}\n`, 'utf8');
   const attempts = [];
 
   const upstream = http.createServer(async (request, response) => {
@@ -84,7 +131,7 @@ test('gateway retries a rate-limited key and streams only the successful respons
     const authorization = request.headers.authorization;
     attempts.push({ authorization, body: Buffer.concat(chunks).toString('utf8') });
 
-    if (authorization === 'Bearer sk-first') {
+    if (authorization === `Bearer ${KEY_ONE}`) {
       response.writeHead(429, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ error: { message: 'inference exceeds tpm/rpm limit' } }));
       return;
@@ -134,8 +181,8 @@ test('gateway retries a rate-limited key and streams only the successful respons
   assert.equal(response.headers.get('x-sensenova-pool-attempts'), '2');
   assert.equal((await response.json()).choices[0].message.content, 'OK');
   assert.deepEqual(attempts.map((item) => item.authorization), [
-    'Bearer sk-first',
-    'Bearer sk-second',
+    `Bearer ${KEY_ONE}`,
+    `Bearer ${KEY_TWO}`,
   ]);
   assert.equal(attempts.every((item) => item.body.includes('deepseek-v4-flash')), true);
   assert.equal(events.some((event) => event.event === 'upstream_retry'), true);
@@ -145,7 +192,7 @@ test('gateway retries a rate-limited key and streams only the successful respons
 test('gateway paces retries after a request has exhausted the whole pool', async (t) => {
   const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sensenova-pool-pacing-'));
   const keyFilePath = path.join(temporaryDir, 'keys');
-  fs.writeFileSync(keyFilePath, 'sk-first\nsk-second\n', 'utf8');
+  fs.writeFileSync(keyFilePath, `${KEY_ONE}\n${KEY_TWO}\n`, 'utf8');
   const attemptTimes = [];
 
   const fetchImpl = async () => {
@@ -205,7 +252,7 @@ test('gateway paces retries after a request has exhausted the whole pool', async
 test('health endpoint hot-reloads the key file without revealing keys', async (t) => {
   const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sensenova-pool-health-'));
   const keyFilePath = path.join(temporaryDir, 'keys');
-  fs.writeFileSync(keyFilePath, 'sk-one\n', 'utf8');
+  fs.writeFileSync(keyFilePath, `${KEY_ONE}\n`, 'utf8');
   const gateway = createGateway({
     keyFilePath,
     logDir: path.join(temporaryDir, 'logs'),
@@ -223,10 +270,140 @@ test('health endpoint hot-reloads the key file without revealing keys', async (t
   let health = await response.json();
   assert.equal(health.accountCount, 1);
 
-  fs.writeFileSync(keyFilePath, 'sk-one\nsk-two\n', 'utf8');
+  fs.writeFileSync(keyFilePath, `${KEY_ONE}\n${KEY_TWO}\n`, 'utf8');
   response = await fetch(`http://127.0.0.1:${address.port}/health`);
   health = await response.json();
   assert.equal(health.accountCount, 2);
-  assert.equal(JSON.stringify(health).includes('sk-one'), false);
-  assert.equal(JSON.stringify(health).includes('sk-two'), false);
+  assert.equal(JSON.stringify(health).includes(KEY_ONE), false);
+  assert.equal(JSON.stringify(health).includes(KEY_TWO), false);
+});
+
+test('key watcher logs additions, removals, replacements, and invalid lines safely', async (t) => {
+  const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sensenova-pool-watch-'));
+  const keyFilePath = path.join(temporaryDir, 'keys');
+  fs.writeFileSync(keyFilePath, `${KEY_ONE}\n`, 'utf8');
+  const events = [];
+  const gateway = createGateway({
+    keyFilePath,
+    logDir: path.join(temporaryDir, 'logs'),
+    localToken: 'test-token',
+    keyWatchIntervalMs: 20,
+    keyReloadDebounceMs: 10,
+    logger: (event) => events.push(event),
+  });
+  await gateway.listen(0);
+
+  t.after(async () => {
+    await gateway.close();
+    fs.rmSync(temporaryDir, { recursive: true, force: true });
+  });
+
+  assert.equal(gateway.keyStore.accounts.length, 1);
+  fs.writeFileSync(keyFilePath, `${KEY_ONE}\n${KEY_TWO}\n`, 'utf8');
+  await waitFor(() => gateway.keyStore.accounts.length === 2);
+
+  fs.writeFileSync(keyFilePath, `${KEY_TWO}\nnot-a-key\n${KEY_THREE}\n`, 'utf8');
+  await waitFor(() => (
+    gateway.keyStore.accounts.length === 2
+    && gateway.keyStore.accounts[1].keyRef !== gateway.keyStore.accounts[0].keyRef
+    && gateway.keyStore.invalidLines.length === 1
+  ));
+
+  const lastReload = events.filter((event) => event.event === 'keys_reloaded').at(-1);
+  assert.equal(lastReload.addedCount, 1);
+  assert.equal(lastReload.removedCount, 1);
+  assert.equal(lastReload.invalidLineCount, 1);
+  assert.deepEqual(lastReload.invalidLines, [{ lineNumber: 2, reason: 'missing_sk_prefix' }]);
+  const serializedEvents = JSON.stringify(events);
+  assert.equal(serializedEvents.includes(KEY_ONE), false);
+  assert.equal(serializedEvents.includes(KEY_TWO), false);
+  assert.equal(serializedEvents.includes(KEY_THREE), false);
+  assert.equal(serializedEvents.includes('not-a-key'), false);
+});
+
+test('an unreadable key file retains the last loaded accounts and later recovers', async (t) => {
+  const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sensenova-pool-retain-'));
+  const keyFilePath = path.join(temporaryDir, 'keys');
+  fs.writeFileSync(keyFilePath, `${KEY_ONE}\n`, 'utf8');
+  const events = [];
+  const gateway = createGateway({
+    keyFilePath,
+    logDir: path.join(temporaryDir, 'logs'),
+    localToken: 'test-token',
+    keyWatchIntervalMs: 20,
+    keyReloadDebounceMs: 10,
+    logger: (event) => events.push(event),
+  });
+  const address = await gateway.listen(0);
+
+  t.after(async () => {
+    await gateway.close();
+    fs.rmSync(temporaryDir, { recursive: true, force: true });
+  });
+
+  fs.rmSync(keyFilePath);
+  await waitFor(() => events.some((event) => event.event === 'key_reload_failed'));
+  let response = await fetch(`http://127.0.0.1:${address.port}/health`);
+  let health = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(health.accountCount, 1);
+  assert.equal(health.keyFileReadError, true);
+
+  fs.writeFileSync(keyFilePath, `${KEY_TWO}\n`, 'utf8');
+  await waitFor(() => gateway.keyStore.accounts[0]?.keyRef !== health.accounts[0].keyRef);
+  response = await fetch(`http://127.0.0.1:${address.port}/health`);
+  health = await response.json();
+  assert.equal(health.accountCount, 1);
+  assert.equal(health.keyFileReadError, false);
+});
+
+test('an upstream authentication failure quarantines only that account', async (t) => {
+  const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sensenova-pool-auth-'));
+  const keyFilePath = path.join(temporaryDir, 'keys');
+  fs.writeFileSync(keyFilePath, `${KEY_ONE}\n${KEY_TWO}\n`, 'utf8');
+  const attempts = [];
+  const events = [];
+  const gateway = createGateway({
+    keyFilePath,
+    logDir: path.join(temporaryDir, 'logs'),
+    localToken: 'test-token',
+    logger: (event) => events.push(event),
+    fetchImpl: async (_url, options) => {
+      const authorization = options.headers.get('authorization');
+      attempts.push(authorization);
+      if (authorization === `Bearer ${KEY_ONE}`) {
+        return new Response(JSON.stringify({ error: { message: 'invalid api key' } }), {
+          status: 401,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'OK' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+  const address = await gateway.listen(0);
+
+  t.after(async () => {
+    await gateway.close();
+    fs.rmSync(temporaryDir, { recursive: true, force: true });
+  });
+
+  const response = await fetch(`http://127.0.0.1:${address.port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer test-token',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [] }),
+  });
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(attempts, [`Bearer ${KEY_ONE}`, `Bearer ${KEY_TWO}`]);
+  const quarantine = events.find((event) => event.event === 'account_quarantined');
+  assert.equal(quarantine.category, 'auth');
+  assert.equal(quarantine.keyLine, 1);
+  assert.equal(JSON.stringify(events).includes(KEY_ONE), false);
+  assert.equal(JSON.stringify(events).includes(KEY_TWO), false);
 });

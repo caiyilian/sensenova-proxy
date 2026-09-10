@@ -53,7 +53,10 @@ The gateway:
 - tracks cooldowns separately per model, so a limited model does not unnecessarily disable the same account for other models;
 - waits locally only when every account is cooling down (up to 10 minutes by default);
 - after one request has exhausted the whole pool, spaces later probes by a fixed 5 seconds instead of repeatedly bursting across every account;
-- hot-reloads `sensenova_apikeys` after it changes, without a restart;
+- watches `sensenova_apikeys` and hot-reloads additions, removals, and replacements within about one second, without a restart;
+- logs reload totals, affected line numbers, and short one-way key references to both the Node terminal and JSONL log, never the keys themselves;
+- ignores malformed key lines and quarantines a key that receives an upstream 401/403 while other accounts continue working;
+- keeps the last successfully loaded account list if the key file is temporarily missing, locked, or unreadable;
 - writes metadata-only JSONL logs to `logs/openai-pool/` and never logs API keys, prompts, or response bodies.
 
 Start it in a terminal:
@@ -85,6 +88,8 @@ For WorkBuddy, use `http://127.0.0.1:18787/v1/chat/completions` with API key `lo
 
 Health information is available locally at `http://127.0.0.1:18787/health`. It contains account numbers and cooldown state, but no credentials.
 
+Edit `sensenova_apikeys` normally, one key per line. A successful change prints a message like `keys_reloaded total=7 added=1 removed=0 invalid=0`; the optional `addedRefs`/`removedRefs` values are only the first eight characters of a SHA-256 fingerprint. Invalid lines are reported by line number without printing their contents. A same-length typo can only be detected when SenseNova rejects that account; it is then logged as `account_quarantined` and the request moves to another account.
+
 Optional environment variables:
 
 | Variable | Default | Purpose |
@@ -95,6 +100,9 @@ Optional environment variables:
 | `SENSENOVA_POOL_MAX_QUEUE_MS` | `600000` | Maximum time a request may wait for a cooled-down account |
 | `SENSENOVA_POOL_PROBE_INTERVAL_MS` | `5000` | Fixed spacing between probes after a full-pool failure |
 | `SENSENOVA_POOL_REQUEST_TIMEOUT_MS` | `300000` | Time allowed for upstream response headers |
+| `SENSENOVA_POOL_EXPECTED_KEY_LENGTH` | `35` | Expected SenseNova key length; use `0` to disable only the length check |
+| `SENSENOVA_POOL_KEY_WATCH_MS` | `1000` | Key-file polling interval; use `0` to disable background watching |
+| `SENSENOVA_POOL_KEY_DEBOUNCE_MS` | `250` | Delay before loading a detected file change |
 | `SENSENOVA_POOL_KEY_FILE` | `sensenova_apikeys` | Alternate key-file path |
 | `SENSENOVA_POOL_LOG_DIR` | `logs/openai-pool` | Alternate JSONL log directory |
 

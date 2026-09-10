@@ -40,6 +40,9 @@ const gateway = createGateway({
   maxQueueMs: envInteger('SENSENOVA_POOL_MAX_QUEUE_MS', 10 * 60_000),
   postSweepProbeIntervalMs: envInteger('SENSENOVA_POOL_PROBE_INTERVAL_MS', 5_000),
   requestTimeoutMs: envInteger('SENSENOVA_POOL_REQUEST_TIMEOUT_MS', 5 * 60_000),
+  expectedKeyLength: envInteger('SENSENOVA_POOL_EXPECTED_KEY_LENGTH', 35),
+  keyWatchIntervalMs: envInteger('SENSENOVA_POOL_KEY_WATCH_MS', 1_000),
+  keyReloadDebounceMs: envInteger('SENSENOVA_POOL_KEY_DEBOUNCE_MS', 250),
   models: MODELS,
 });
 
