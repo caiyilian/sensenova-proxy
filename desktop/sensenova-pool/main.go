@@ -13,14 +13,15 @@ import (
 var version = "dev"
 
 type commandLineOptions struct {
-	autoStart    bool
-	hidden       bool
-	allowLAN     bool
-	localOnly    bool
-	syncOpenCode bool
-	dataDir      string
-	keyFile      string
-	port         int
+	autoStart        bool
+	hidden           bool
+	allowLAN         bool
+	localOnly        bool
+	syncLocalClients bool
+	syncOpenCode     bool
+	dataDir          string
+	keyFile          string
+	port             int
 }
 
 func main() {
@@ -37,6 +38,7 @@ func parseCommandLine() commandLineOptions {
 	flag.BoolVar(&options.hidden, "hidden", false, "start hidden in the notification area")
 	flag.BoolVar(&options.allowLAN, "allow-lan", false, "allow clients on the local network")
 	flag.BoolVar(&options.localOnly, "local-only", false, "listen on loopback only")
+	flag.BoolVar(&options.syncLocalClients, "sync-local-clients", false, "detect and synchronize installed OpenCode and WorkBuddy clients")
 	flag.BoolVar(&options.syncOpenCode, "sync-opencode", false, "synchronize the current local token to the user's OpenCode config")
 	flag.StringVar(&options.dataDir, "data-dir", "", "override the settings and log directory")
 	flag.StringVar(&options.keyFile, "key-file", "", "override the API key file")
@@ -110,6 +112,29 @@ func runApplication(options commandLineOptions) error {
 			"created": backupPath == "",
 			"source":  "command_line",
 		})
+	}
+	if options.syncLocalClients {
+		openCodePath, pathErr := defaultOpenCodeConfigPath()
+		if pathErr != nil {
+			return pathErr
+		}
+		modelsPath, pathErr := defaultWorkBuddyModelsPath()
+		if pathErr != nil {
+			return pathErr
+		}
+		result := syncDetectedLocalClients(openCodePath, modelsPath, settings.Port, settings.LocalToken)
+		logger.Log("local_clients_synced", map[string]any{
+			"opencode_detected":  result.OpenCode.Detected,
+			"opencode_success":   result.OpenCode.Detected && result.OpenCode.Err == nil,
+			"workbuddy_detected": result.WorkBuddy.Detected,
+			"workbuddy_success":  result.WorkBuddy.Detected && result.WorkBuddy.Err == nil,
+			"workbuddy_added":    result.WorkBuddy.Added,
+			"workbuddy_updated":  result.WorkBuddy.Updated,
+			"source":             "command_line",
+		})
+		if syncErr := result.Err(); syncErr != nil {
+			return syncErr
+		}
 	}
 
 	keyStore := NewKeyStore(settings.KeyFilePath, logger, time.Second)
