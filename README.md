@@ -5,6 +5,7 @@ Lightweight local gateways for SenseNova and Agnes:
 - `sensenova-proxy.js` keeps the original Anthropic Messages API endpoint for Claude Code/Lucky.
 - `opencode-pool-proxy.js` exposes an OpenAI-compatible endpoint for OpenCode, WorkBuddy, and similar clients, with automatic failover and per-model cooldowns.
 - `agnes-proxy.js` exposes an OpenAI-compatible Agnes endpoint with direct/Clash failover, guarded node recovery, and local rate-limit queuing.
+- `desktop/sensenova-pool/` contains the standalone Windows tray application for sharing the SenseNova pool with users who do not have Node.js installed.
 
 ## Why
 

@@ -11,6 +11,10 @@ npm-debug.log*
 # Runtime logs
 logs/
 
+# Native desktop build output
+desktop/sensenova-pool/dist/
+desktop/sensenova-pool/rsrc.syso
+
 # OS
 .DS_Store
 Thumbs.db
