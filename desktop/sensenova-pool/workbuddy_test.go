@@ -89,14 +89,72 @@ func TestSyncWorkBuddyCreatesMissingFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var document struct {
-		Models []json.RawMessage `json:"models"`
-	}
-	if err := json.Unmarshal(data, &document); err != nil {
+	var models []json.RawMessage
+	if err := json.Unmarshal(data, &models); err != nil {
 		t.Fatal(err)
 	}
-	if len(document.Models) != len(supportedModels) {
-		t.Fatalf("created model count = %d, want %d", len(document.Models), len(supportedModels))
+	if len(models) != len(supportedModels) {
+		t.Fatalf("created model count = %d, want %d", len(models), len(supportedModels))
+	}
+}
+
+func TestSyncWorkBuddySupportsTopLevelArrayFromFreshInstall(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "models.json")
+	original := `[
+  {
+    "id": "deepseek-v4-flash",
+    "name": "deepseek-v4-flash",
+    "vendor": "Custom",
+    "url": "https://token.sensenova.cn/v1",
+    "apiKey": "old-upstream-key",
+    "supportsToolCall": true,
+    "supportsImages": false,
+    "supportsReasoning": true,
+    "useCustomProtocol": false
+  },
+  {
+    "id": "agnes-2.0-flash",
+    "name": "Agnes 2.0 Flash",
+    "vendor": "Agnes Resilient",
+    "url": "http://127.0.0.1:18788/v1/chat/completions",
+    "apiKey": "keep-agnes-token"
+  }
+]`
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := syncWorkBuddyConfig(path, workBuddyChatURL(18787), "new-local-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Updated != 1 || result.Added != 5 || result.BackupPath == "" {
+		t.Fatalf("unexpected array sync result: %+v", result)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) == 0 || data[0] != '[' {
+		t.Fatalf("top-level array format was not preserved: %s", data)
+	}
+	var models []map[string]any
+	if err := json.Unmarshal(data, &models); err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != len(supportedModels)+1 {
+		t.Fatalf("model count = %d, want %d", len(models), len(supportedModels)+1)
+	}
+	for _, model := range models {
+		if model["id"] == "agnes-2.0-flash" {
+			if model["apiKey"] != "keep-agnes-token" {
+				t.Fatal("Agnes model in array document was modified")
+			}
+			continue
+		}
+		if model["apiKey"] != "new-local-token" || model["url"] != workBuddyChatURL(18787) {
+			t.Fatalf("SenseNova model %v was not redirected to the pool", model["id"])
+		}
 	}
 }
 

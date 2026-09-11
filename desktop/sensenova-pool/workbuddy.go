@@ -29,6 +29,13 @@ type WorkBuddySyncResult struct {
 	BackupPath string
 }
 
+type workBuddyDocumentFormat uint8
+
+const (
+	workBuddyArrayDocument workBuddyDocumentFormat = iota
+	workBuddyObjectDocument
+)
+
 func defaultWorkBuddyModelsPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -60,18 +67,28 @@ func syncWorkBuddyConfig(path, endpoint, localToken string) (WorkBuddySyncResult
 		return result, fmt.Errorf("读取 WorkBuddy 配置：%w", err)
 	}
 
+	format := workBuddyArrayDocument
 	root := make(map[string]json.RawMessage)
-	if exists && len(bytes.TrimSpace(data)) > 0 {
-		trimmed := bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
-		if err := json.Unmarshal(trimmed, &root); err != nil {
-			return result, fmt.Errorf("解析 WorkBuddy models.json：%w", err)
-		}
-	}
-
 	var models []json.RawMessage
-	if raw, ok := root["models"]; ok {
-		if err := json.Unmarshal(raw, &models); err != nil {
-			return result, errors.New("WorkBuddy models.json 的 models 字段不是数组")
+	if exists && len(bytes.TrimSpace(data)) > 0 {
+		trimmed := bytes.TrimSpace(bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf}))
+		switch trimmed[0] {
+		case '[':
+			if err := json.Unmarshal(trimmed, &models); err != nil {
+				return result, fmt.Errorf("解析 WorkBuddy models.json 数组：%w", err)
+			}
+		case '{':
+			format = workBuddyObjectDocument
+			if err := json.Unmarshal(trimmed, &root); err != nil {
+				return result, fmt.Errorf("解析 WorkBuddy models.json 对象：%w", err)
+			}
+			if raw, ok := root["models"]; ok {
+				if err := json.Unmarshal(raw, &models); err != nil {
+					return result, errors.New("WorkBuddy models.json 的 models 字段不是数组")
+				}
+			}
+		default:
+			return result, errors.New("WorkBuddy models.json 的顶层必须是模型数组或包含 models 数组的对象")
 		}
 	}
 
@@ -138,14 +155,22 @@ func syncWorkBuddyConfig(path, endpoint, localToken string) (WorkBuddySyncResult
 		return result, nil
 	}
 
-	modelsJSON, err := json.Marshal(updatedModels)
-	if err != nil {
-		return result, fmt.Errorf("生成 WorkBuddy 模型列表：%w", err)
-	}
-	root["models"] = modelsJSON
-	output, err := json.MarshalIndent(root, "", "  ")
-	if err != nil {
-		return result, fmt.Errorf("生成 WorkBuddy 配置：%w", err)
+	var output []byte
+	if format == workBuddyArrayDocument {
+		output, err = json.MarshalIndent(updatedModels, "", "  ")
+		if err != nil {
+			return result, fmt.Errorf("生成 WorkBuddy 模型数组：%w", err)
+		}
+	} else {
+		modelsJSON, marshalErr := json.Marshal(updatedModels)
+		if marshalErr != nil {
+			return result, fmt.Errorf("生成 WorkBuddy 模型列表：%w", marshalErr)
+		}
+		root["models"] = modelsJSON
+		output, err = json.MarshalIndent(root, "", "  ")
+		if err != nil {
+			return result, fmt.Errorf("生成 WorkBuddy 配置：%w", err)
+		}
 	}
 	output = append(output, '\n')
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -177,6 +202,7 @@ func looksLikeSenseNovaWorkBuddyModel(fields map[string]any) bool {
 	endpoint, _ := fields["url"].(string)
 	return strings.EqualFold(strings.TrimSpace(vendor), "SenseNova") ||
 		strings.Contains(strings.ToLower(name), "sensenova") ||
+		strings.Contains(strings.ToLower(endpoint), "sensenova.cn") ||
 		strings.Contains(endpoint, ":18787/")
 }
 
