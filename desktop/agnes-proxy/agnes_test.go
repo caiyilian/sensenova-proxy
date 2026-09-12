@@ -1,16 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -64,70 +66,208 @@ func TestConnectivityMonitorReportsClashOnlyRoute(t *testing.T) {
 	}
 }
 
-func TestProxyControllerStartsNodeAndReloadsChangedEnvironmentKey(t *testing.T) {
-	nodePath, err := exec.LookPath("node.exe")
-	if err != nil {
-		t.Skip("node.exe is required for the Agnes desktop controller")
-	}
+func TestNativeProxyUsesChangedKeyWithoutRestart(t *testing.T) {
 	tempDir := t.TempDir()
-	scriptPath := filepath.Join(tempDir, "fake-agnes.js")
-	script := `
-const http = require('http');
-console.log(process.env.AGNES_API_KEY);
-const health = {status:'ok',stats:{requests:0,successes:0,failures:0,rateRetries:0,routeFallbacks:0,recoveries:0},routes:{preferred:'clash',lastSuccessfulRoute:'clash',directProbeAfterMs:1000},rateLimits:[]};
-http.createServer((req,res) => {res.setHeader('content-type','application/json');res.end(JSON.stringify(health));}).listen(Number(process.env.AGNES_PROXY_PORT),'127.0.0.1');
-`
-	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
+	firstKey := "first-agnes-controller-test-secret"
+	secondKey := "second-agnes-controller-test-secret"
+	keyPath := filepath.Join(tempDir, "agnes-key.data")
+	if err := os.WriteFile(keyPath, []byte(firstKey+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	received := make(chan string, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		received <- request.Header.Get("Authorization")
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"id":"test","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
 	port := reservePort(t)
 	paths := AppPaths{DataDir: tempDir, SettingsFile: filepath.Join(tempDir, "settings.json"), LogDir: filepath.Join(tempDir, "logs")}
 	logger, err := NewJSONLLogger(paths.LogDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	keys := NewAgnesKeyMonitor(logger, time.Second)
-	var keyMu sync.RWMutex
-	keyValue := "first-agnes-controller-test-secret"
-	keys.reader = func() (string, string) {
-		keyMu.RLock()
-		defer keyMu.RUnlock()
-		return keyValue, "test"
-	}
+	keys := NewAgnesKeyMonitor(logger, time.Second, keyPath)
 	keys.Refresh()
-	controller := NewProxyController(Settings{Port: port, NodePath: nodePath, ProxyScriptPath: scriptPath}, paths, keys, logger, "local-controller-test-token")
+	controller, err := NewProxyController(Settings{Port: port}, keys, nil, logger, "local-controller-test-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := url.Parse(upstream.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.gateway.upstream = target
 	controller.RunMonitor()
 	defer controller.Close()
 	if err := controller.Start(); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, 5*time.Second, func() bool { return controller.Status().HealthOK })
-	firstPID := controller.Status().PID
-	if firstPID == 0 {
-		t.Fatal("Node proxy PID is missing")
+	callGateway := func() {
+		request, requestErr := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", port), strings.NewReader(`{"model":"agnes-2.0-flash","messages":[]}`))
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Authorization", "Bearer local-controller-test-token")
+		request.Header.Set("Content-Type", "application/json")
+		response, requestErr := http.DefaultClient.Do(request)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("unexpected gateway status: %d", response.StatusCode)
+		}
+	}
+	callGateway()
+	if authorization := <-received; authorization != "Bearer "+firstKey {
+		t.Fatalf("gateway used unexpected first credential: %q", authorization)
 	}
 
-	keyMu.Lock()
-	keyValue = "second-agnes-controller-test-secret"
-	keyMu.Unlock()
+	if err := os.WriteFile(keyPath, []byte(secondKey+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	keys.Refresh()
-	eventually(t, 7*time.Second, func() bool {
-		status := controller.Status()
-		return status.HealthOK && status.PID != 0 && status.PID != firstPID
-	})
+	callGateway()
+	if authorization := <-received; authorization != "Bearer "+secondKey {
+		t.Fatalf("gateway did not hot-reload the credential: %q", authorization)
+	}
 
 	controller.Close()
 	contents := readLogs(t, paths.LogDir)
-	if strings.Contains(contents, "first-agnes-controller-test-secret") || strings.Contains(contents, "second-agnes-controller-test-secret") {
+	if strings.Contains(contents, firstKey) || strings.Contains(contents, secondKey) {
 		t.Fatal("controller log exposed an Agnes API key")
 	}
 }
 
-func TestReplaceEnvironmentIsCaseInsensitive(t *testing.T) {
-	result := replaceEnvironment([]string{"Path=one", "agnes_api_key=old", "OTHER=value"}, map[string]string{"AGNES_API_KEY": "new"})
-	joined := strings.Join(result, "\n")
-	if strings.Contains(joined, "old") || !strings.Contains(joined, "AGNES_API_KEY=new") {
-		t.Fatalf("unexpected environment replacement: %v", result)
+func TestParseAgnesKeyFileFormats(t *testing.T) {
+	expected := "agnes-portable-test-key"
+	for name, data := range map[string]string{
+		"plain":  expected + "\n",
+		"dotenv": "AGNES_API_KEY='" + expected + "'\n",
+		"json":   `{"apiKey":"` + expected + `"}`,
+		"array":  `[{"token":"` + expected + `"}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if actual := parseAgnesKeyFile([]byte(data)); actual != expected {
+				t.Fatalf("unexpected key: %q", actual)
+			}
+		})
+	}
+}
+
+func TestAgnesKeyFileHotReloadRetainsLastGoodValue(t *testing.T) {
+	tempDir := t.TempDir()
+	keyPath := filepath.Join(tempDir, "key-without-extension")
+	firstKey := "agnes-retained-first-secret"
+	secondKey := "agnes-retained-second-secret"
+	if err := os.WriteFile(keyPath, []byte(firstKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logger, err := NewJSONLLogger(filepath.Join(tempDir, "logs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	monitor := NewAgnesKeyMonitor(logger, time.Second, keyPath)
+	first := monitor.Refresh()
+	if !first.Present || monitor.APIKey() != firstKey {
+		t.Fatalf("unexpected first key snapshot: %+v", first)
+	}
+	if err := os.WriteFile(keyPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	retained := monitor.Refresh()
+	if !retained.Present || !retained.RetainedLastGood || retained.LastError == "" || monitor.APIKey() != firstKey {
+		t.Fatalf("last good key was not retained: %+v", retained)
+	}
+	if err := os.WriteFile(keyPath, []byte(secondKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second := monitor.Refresh()
+	if second.LastError != "" || second.KeyRef == first.KeyRef || monitor.APIKey() != secondKey {
+		t.Fatalf("replacement key was not loaded: %+v", second)
+	}
+	contents := readLogs(t, logger.Dir())
+	if strings.Contains(contents, firstKey) || strings.Contains(contents, secondKey) {
+		t.Fatal("key hot-reload log exposed an Agnes API key")
+	}
+}
+
+func TestGatewayRetriesDisconnectBeforeReturningSuccess(t *testing.T) {
+	logger, err := NewJSONLLogger(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := NewAgnesKeyMonitor(logger, time.Second)
+	keys.reader = func() (string, string) { return "agnes-network-retry-secret", "test" }
+	keys.Refresh()
+	gateway, err := NewAgnesGateway(0, keys, nil, logger, "local-retry-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway.direct = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("connection refused")
+	})}
+	clashAttempts := 0
+	gateway.clash = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		clashAttempts++
+		if clashAttempts == 1 {
+			return nil, errors.New("timeout awaiting response headers")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"recovered"}}]}`)),
+			Request:    request,
+		}, nil
+	})}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"agnes-3.0-flash","messages":[]}`))
+	request.Header.Set("Authorization", "Bearer local-retry-token")
+	response := httptest.NewRecorder()
+	started := time.Now()
+	gateway.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "recovered") {
+		t.Fatalf("unexpected response: status=%d body=%s", response.Code, response.Body.String())
+	}
+	if clashAttempts != 2 || time.Since(started) < 1900*time.Millisecond {
+		t.Fatalf("disconnect was not retried with backoff: attempts=%d duration=%s", clashAttempts, time.Since(started))
+	}
+	contents := readLogs(t, logger.Dir())
+	if !strings.Contains(contents, "network_retry_scheduled") || strings.Contains(contents, keys.APIKey()) {
+		t.Fatal("retry was not logged safely")
+	}
+}
+
+func TestEmbeddedClashRecoveryExtractsWithoutExternalRepository(t *testing.T) {
+	tempDir := t.TempDir()
+	logger, err := NewJSONLLogger(filepath.Join(tempDir, "logs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := AppPaths{
+		DataDir:            tempDir,
+		RecoveryScriptFile: filepath.Join(tempDir, "clash-node-helper.ps1"),
+	}
+	recovery, err := NewClashRecovery(paths, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := recovery.Snapshot()
+	if !snapshot.Enabled || snapshot.ScriptPath != paths.RecoveryScriptFile {
+		t.Fatalf("embedded recovery helper is unavailable: %+v", snapshot)
+	}
+	data, err := os.ReadFile(paths.RecoveryScriptFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(data, []byte{0xEF, 0xBB, 0xBF}) {
+		t.Fatal("recovery helper must include a UTF-8 BOM for Windows PowerShell 5.1")
+	}
+	if !strings.Contains(string(data), "良心云|选择|Proxy") {
+		t.Fatal("embedded recovery helper is not the Liangxinyun-aware version")
 	}
 }
 

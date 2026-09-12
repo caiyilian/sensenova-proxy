@@ -10,24 +10,24 @@ import (
 
 const (
 	appName                = "Agnes Proxy"
-	settingsVersion        = 1
+	settingsVersion        = 2
 	defaultProxyPort       = 18788
 	defaultLocalProxyToken = "local-agnes-proxy"
 )
 
 type Settings struct {
-	Version         int    `json:"version"`
-	Port            int    `json:"port"`
-	ProxyScriptPath string `json:"proxyScriptPath,omitempty"`
-	NodePath        string `json:"nodePath,omitempty"`
-	WindowWidth     int    `json:"windowWidth,omitempty"`
-	WindowHeight    int    `json:"windowHeight,omitempty"`
+	Version      int    `json:"version"`
+	Port         int    `json:"port"`
+	KeyFilePath  string `json:"keyFilePath,omitempty"`
+	WindowWidth  int    `json:"windowWidth,omitempty"`
+	WindowHeight int    `json:"windowHeight,omitempty"`
 }
 
 type AppPaths struct {
-	DataDir      string
-	SettingsFile string
-	LogDir       string
+	DataDir            string
+	SettingsFile       string
+	LogDir             string
+	RecoveryScriptFile string
 }
 
 func resolveAppPaths(override string) (AppPaths, error) {
@@ -53,9 +53,10 @@ func resolveAppPaths(override string) (AppPaths, error) {
 		return AppPaths{}, fmt.Errorf("resolve data directory: %w", err)
 	}
 	return AppPaths{
-		DataDir:      abs,
-		SettingsFile: filepath.Join(abs, "settings.json"),
-		LogDir:       filepath.Join(abs, "logs"),
+		DataDir:            abs,
+		SettingsFile:       filepath.Join(abs, "settings.json"),
+		LogDir:             filepath.Join(abs, "logs"),
+		RecoveryScriptFile: filepath.Join(abs, "clash-node-helper.ps1"),
 	}, nil
 }
 

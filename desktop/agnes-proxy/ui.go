@@ -33,14 +33,14 @@ type DesktopUI struct {
 	clashLabel       *walk.Label
 	routeLabel       *walk.Label
 	recoveryLabel    *walk.Label
-	nodePathEdit     *walk.LineEdit
-	scriptPathEdit   *walk.LineEdit
+	keyPathEdit      *walk.LineEdit
 	baseURLEdit      *walk.LineEdit
 	localTokenEdit   *walk.LineEdit
 	logPathEdit      *walk.LineEdit
 	autoStartCheck   *walk.CheckBox
 	restartButton    *walk.PushButton
 	refreshKeyButton *walk.PushButton
+	openKeyButton    *walk.PushButton
 
 	exiting           bool
 	autoStartUpdating bool
@@ -76,15 +76,16 @@ func (ui *DesktopUI) Run(startHidden bool) error {
 		Title:    appName,
 		Icon:     icon,
 		Visible:  false,
-		MinSize:  d.Size{Width: 740, Height: 560},
-		Size:     d.Size{Width: max(ui.settings.WindowWidth, 790), Height: max(ui.settings.WindowHeight, 640)},
+		MinSize:  d.Size{Width: 740, Height: 600},
+		Size:     d.Size{Width: max(ui.settings.WindowWidth, 810), Height: max(ui.settings.WindowHeight, 670)},
 		Layout: d.VBox{
 			Margins: d.Margins{Left: 16, Top: 14, Right: 16, Bottom: 14},
 			Spacing: 10,
 		},
+		OnDropFiles: ui.dropKeyFiles,
 		Children: []d.Widget{
 			d.Label{Text: "Agnes 弹性代理", Font: d.Font{Family: "Microsoft YaHei UI", PointSize: 14, Bold: true}},
-			d.Label{Text: "独立托盘控制器；后台代理进程无终端窗口，并保留直连、Clash 回退与自动节点恢复。"},
+			d.Label{Text: "单文件便携版；代理核心已内置，无需 Node.js 或仓库。支持直连、Clash 7890、断联重试与良心云节点自动恢复。"},
 			d.GroupBox{
 				Title:  "运行状态",
 				Layout: d.VBox{Margins: d.Margins{Left: 10, Top: 8, Right: 10, Bottom: 9}, Spacing: 5},
@@ -98,15 +99,26 @@ func (ui *DesktopUI) Run(startHidden bool) error {
 				},
 			},
 			d.GroupBox{
-				Title:  "代理控制",
-				Layout: d.Grid{Columns: 3, Margins: d.Margins{Left: 10, Top: 8, Right: 10, Bottom: 9}, Spacing: 7},
+				Title:  "API Key 文件与代理控制",
+				Layout: d.VBox{Margins: d.Margins{Left: 10, Top: 8, Right: 10, Bottom: 9}, Spacing: 7},
 				Children: []d.Widget{
-					d.Label{Text: "Node.js"},
-					d.LineEdit{AssignTo: &ui.nodePathEdit, ReadOnly: true, StretchFactor: 1},
-					d.PushButton{AssignTo: &ui.restartButton, Text: "重启代理", MinSize: d.Size{Width: 88}, OnClicked: ui.restartProxy},
-					d.Label{Text: "代理脚本"},
-					d.LineEdit{AssignTo: &ui.scriptPathEdit, ReadOnly: true, StretchFactor: 1},
-					d.PushButton{AssignTo: &ui.refreshKeyButton, Text: "重读环境变量", MinSize: d.Size{Width: 104}, OnClicked: ui.refreshKey},
+					d.Composite{
+						Layout: d.HBox{MarginsZero: true, Spacing: 7},
+						Children: []d.Widget{
+							d.LineEdit{AssignTo: &ui.keyPathEdit, ReadOnly: true, StretchFactor: 1},
+							d.PushButton{Text: "选择文件", MinSize: d.Size{Width: 88}, OnClicked: ui.chooseKeyFile},
+							d.PushButton{AssignTo: &ui.openKeyButton, Text: "打开文件", MinSize: d.Size{Width: 88}, OnClicked: ui.openKeyFile},
+						},
+					},
+					d.Composite{
+						Layout: d.HBox{MarginsZero: true, Spacing: 7},
+						Children: []d.Widget{
+							d.PushButton{AssignTo: &ui.refreshKeyButton, Text: "立即重读", MinSize: d.Size{Width: 88}, OnClicked: ui.refreshKey},
+							d.PushButton{AssignTo: &ui.restartButton, Text: "重启代理", MinSize: d.Size{Width: 88}, OnClicked: ui.restartProxy},
+							d.HSpacer{},
+						},
+					},
+					d.Label{Text: "支持任意扩展名、无后缀文件和拖入窗口；保存路径后每 3 秒自动重读，临时写坏时保留上一次有效 Key。"},
 				},
 			},
 			d.GroupBox{
@@ -231,14 +243,77 @@ func (ui *DesktopUI) restartProxy() {
 	}()
 }
 
+func (ui *DesktopUI) chooseKeyFile() {
+	dialog := walk.FileDialog{
+		Title:  "选择 Agnes API Key 文件",
+		Filter: "所有文件 (*)|*",
+	}
+	if ui.settings.KeyFilePath != "" {
+		dialog.FilePath = ui.settings.KeyFilePath
+		dialog.InitialDirPath = filepath.Dir(ui.settings.KeyFilePath)
+	}
+	accepted, err := dialog.ShowOpen(ui.mainWindow)
+	if err != nil {
+		walk.MsgBox(ui.mainWindow, appName, "无法打开文件选择器：\n"+redactText(err.Error()), walk.MsgBoxIconError)
+		return
+	}
+	if accepted {
+		ui.useKeyFile(dialog.FilePath, "file_dialog")
+	}
+}
+
+func (ui *DesktopUI) dropKeyFiles(files []string) {
+	if len(files) == 0 {
+		return
+	}
+	if len(files) > 1 && ui.notifyIcon != nil {
+		_ = ui.notifyIcon.ShowWarning(appName, "一次只能使用一个 API Key 文件，已选择拖入的第一个文件。")
+	}
+	ui.useKeyFile(files[0], "drag_drop")
+}
+
+func (ui *DesktopUI) useKeyFile(path, source string) {
+	normalized, err := normalizeAgnesKeyFilePath(path)
+	if err != nil {
+		walk.MsgBox(ui.mainWindow, appName, "无法使用该文件：\n"+redactText(err.Error()), walk.MsgBoxIconError)
+		return
+	}
+	if err := ui.keys.SetPath(normalized); err != nil {
+		walk.MsgBox(ui.mainWindow, appName, "无法加载该文件：\n"+redactText(err.Error()), walk.MsgBoxIconError)
+		return
+	}
+	ui.settings.KeyFilePath = normalized
+	if err := saveSettings(ui.paths, ui.settings); err != nil {
+		walk.MsgBox(ui.mainWindow, appName, "API Key 已加载，但无法保存设置：\n"+redactText(err.Error()), walk.MsgBoxIconWarning)
+	}
+	ui.logger.Log("key_file_selected", map[string]any{"source": source, "fileName": filepath.Base(normalized)})
+	ui.refreshUI()
+	if ui.notifyIcon != nil {
+		_ = ui.notifyIcon.ShowInfo(appName, "API Key 文件已加载；后续修改会自动生效")
+	}
+}
+
+func (ui *DesktopUI) openKeyFile() {
+	path := ui.keys.Path()
+	if path == "" {
+		walk.MsgBox(ui.mainWindow, appName, "尚未选择 API Key 文件。", walk.MsgBoxIconInformation)
+		return
+	}
+	if err := openPath(path); err != nil {
+		walk.MsgBox(ui.mainWindow, appName, "无法打开 API Key 文件：\n"+redactText(err.Error()), walk.MsgBoxIconError)
+	}
+}
+
 func (ui *DesktopUI) refreshKey() {
 	before := ui.keys.Snapshot().Fingerprint
 	after := ui.keys.Refresh()
 	ui.refreshUI()
 	if after.Fingerprint != before {
-		ui.restartProxy()
+		if ui.notifyIcon != nil {
+			_ = ui.notifyIcon.ShowInfo(appName, "已加载新的 Agnes API Key，无需重启代理")
+		}
 	} else if ui.notifyIcon != nil {
-		_ = ui.notifyIcon.ShowInfo(appName, "环境变量已重新读取，API Key 未发生变化")
+		_ = ui.notifyIcon.ShowInfo(appName, "API Key 文件已重新读取，内容未发生变化")
 	}
 }
 
@@ -337,14 +412,14 @@ func (ui *DesktopUI) refreshUI() {
 	ui.baseURLEdit.SetText(baseURL)
 	ui.localTokenEdit.SetText(ui.localToken)
 	ui.logPathEdit.SetText(ui.paths.LogDir)
-	ui.nodePathEdit.SetText(controller.NodePath)
-	ui.scriptPathEdit.SetText(controller.ScriptPath)
+	ui.keyPathEdit.SetText(ui.keys.Path())
+	ui.openKeyButton.SetEnabled(ui.keys.Path() != "")
 
 	if controller.Running && controller.HealthOK {
-		ui.serviceLabel.SetText(fmt.Sprintf("代理服务：运行中 · PID %d · %s", controller.PID, baseURL))
+		ui.serviceLabel.SetText(fmt.Sprintf("代理服务：内置引擎运行中 · %s", baseURL))
 		ui.serviceLabel.SetTextColor(walk.RGB(25, 126, 65))
 	} else if controller.Running {
-		ui.serviceLabel.SetText(fmt.Sprintf("代理服务：后台进程已启动 · PID %d · 等待健康检查", controller.PID))
+		ui.serviceLabel.SetText("代理服务：内置引擎已启动 · 等待健康检查")
 		ui.serviceLabel.SetTextColor(walk.RGB(190, 103, 0))
 	} else {
 		message := controller.LastError
@@ -355,11 +430,14 @@ func (ui *DesktopUI) refreshUI() {
 		ui.serviceLabel.SetTextColor(walk.RGB(190, 48, 48))
 	}
 
-	if key.Present {
-		ui.keyLabel.SetText(fmt.Sprintf("AGNES_API_KEY：已检测 · %s · Key Ref %s", key.Source, key.KeyRef))
+	if key.Present && key.LastError == "" {
+		ui.keyLabel.SetText(fmt.Sprintf("AGNES_API_KEY：已加载 · %s · Key Ref %s", key.Source, key.KeyRef))
 		ui.keyLabel.SetTextColor(walk.RGB(25, 126, 65))
+	} else if key.RetainedLastGood {
+		ui.keyLabel.SetText("AGNES_API_KEY：文件当前不可用，仍在使用上一次有效 Key · " + key.LastError)
+		ui.keyLabel.SetTextColor(walk.RGB(190, 103, 0))
 	} else {
-		ui.keyLabel.SetText("AGNES_API_KEY：未检测到，请先设置用户环境变量")
+		ui.keyLabel.SetText("AGNES_API_KEY：尚未加载 · 请点击“选择文件”或把文件拖入窗口")
 		ui.keyLabel.SetTextColor(walk.RGB(190, 48, 48))
 	}
 
@@ -385,22 +463,38 @@ func (ui *DesktopUI) refreshUI() {
 			}
 			rateText = " · 限流队列：" + strings.Join(items, "，")
 		}
-		ui.routeLabel.SetText(fmt.Sprintf("请求路线：优先 %s · 上次成功 %s%s", preferred, last, rateText))
+		ui.routeLabel.SetText(fmt.Sprintf(
+			"请求路线：优先 %s · 上次成功 %s · 成功 %d/%d · 路线切换/断联 %d · 限流重试 %d · 节点恢复 %d%s",
+			preferred,
+			last,
+			controller.Health.Stats.Successes,
+			controller.Health.Stats.Requests,
+			controller.Health.Stats.RouteFallbacks,
+			controller.Health.Stats.RateRetries,
+			controller.Health.Stats.Recoveries,
+			rateText,
+		))
 	} else {
 		ui.routeLabel.SetText("请求路线：" + network.Preferred)
 	}
 
-	recoveryPath := recoveryScriptPath(controller.ScriptPath)
-	if recoveryPath != "" {
-		if info, err := os.Stat(recoveryPath); err == nil && !info.IsDir() {
-			ui.recoveryLabel.SetText("节点自动恢复：已启用 · 请求路线全部失败时自动调用 " + recoveryPath)
-			ui.recoveryLabel.SetTextColor(walk.RGB(25, 126, 65))
-		} else {
-			ui.recoveryLabel.SetText("节点自动恢复：脚本不存在 · " + recoveryPath)
-			ui.recoveryLabel.SetTextColor(walk.RGB(190, 103, 0))
+	recovery := ui.controller.RecoveryStatus()
+	if recovery.Enabled && recovery.Running {
+		ui.recoveryLabel.SetText("节点自动恢复：正在检测良心云节点并切换，请稍候…")
+		ui.recoveryLabel.SetTextColor(walk.RGB(190, 103, 0))
+	} else if recovery.Enabled {
+		detail := "已内置 · Clash 路线失败时自动检测并切换良心云可用节点"
+		if !recovery.LastResult.Finished.IsZero() {
+			if recovery.LastResult.OK {
+				detail += " · 上次切换成功"
+			} else {
+				detail += " · 上次结果 " + recovery.LastResult.Reason
+			}
 		}
+		ui.recoveryLabel.SetText("节点自动恢复：" + detail)
+		ui.recoveryLabel.SetTextColor(walk.RGB(25, 126, 65))
 	} else {
-		ui.recoveryLabel.SetText("节点自动恢复：无法确定恢复脚本路径")
+		ui.recoveryLabel.SetText("节点自动恢复：内置恢复组件不可用，请查看日志")
 		ui.recoveryLabel.SetTextColor(walk.RGB(190, 103, 0))
 	}
 
@@ -436,15 +530,23 @@ func translateRoute(route string) string {
 	}
 }
 
-func recoveryScriptPath(proxyScript string) string {
-	if configured := strings.TrimSpace(os.Getenv("AGNES_CLASH_RECOVERY_SCRIPT")); configured != "" {
-		abs, _ := filepath.Abs(configured)
-		return abs
+func normalizeAgnesKeyFilePath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("文件路径为空")
 	}
-	if proxyScript == "" {
-		return ""
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("解析文件路径：%w", err)
 	}
-	return filepath.Clean(filepath.Join(filepath.Dir(proxyScript), "..", "android-install", "tools", "clash-node-helper.ps1"))
+	info, err := os.Stat(absolute)
+	if err != nil {
+		return "", fmt.Errorf("读取文件：%w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("拖入的是文件夹，请选择一个 API Key 文件")
+	}
+	return absolute, nil
 }
 
 func openPath(path string) error {

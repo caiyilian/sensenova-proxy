@@ -15,8 +15,7 @@ type commandLineOptions struct {
 	autoStart bool
 	hidden    bool
 	dataDir   string
-	nodePath  string
-	script    string
+	keyFile   string
 	port      int
 }
 
@@ -33,8 +32,7 @@ func parseCommandLine() commandLineOptions {
 	flag.BoolVar(&options.autoStart, "autostart", false, "start hidden from the current-user startup entry")
 	flag.BoolVar(&options.hidden, "hidden", false, "start hidden in the notification area")
 	flag.StringVar(&options.dataDir, "data-dir", "", "override the settings and log directory")
-	flag.StringVar(&options.nodePath, "node", "", "override node.exe path")
-	flag.StringVar(&options.script, "script", "", "override agnes-proxy.js path")
+	flag.StringVar(&options.keyFile, "key-file", "", "override the Agnes API key file")
 	flag.IntVar(&options.port, "port", -1, "override the local listening port")
 	flag.Parse()
 	return options
@@ -65,15 +63,8 @@ func runApplication(options commandLineOptions) error {
 		}
 		settings.Port = options.port
 	}
-	if options.nodePath != "" {
-		settings.NodePath = options.nodePath
-	}
-	if options.script != "" {
-		settings.ProxyScriptPath = options.script
-	}
-	if nodePath, scriptPath, runtimeErr := validateRuntime(settings.NodePath, settings.ProxyScriptPath); runtimeErr == nil {
-		settings.NodePath = nodePath
-		settings.ProxyScriptPath = scriptPath
+	if options.keyFile != "" {
+		settings.KeyFilePath = options.keyFile
 	}
 	if err := saveSettings(paths, settings); err != nil {
 		return err
@@ -92,7 +83,7 @@ func runApplication(options commandLineOptions) error {
 	localToken, localTokenSource := readAgnesLocalToken()
 	logger.Log("local_gateway_token_selected", map[string]any{"source": localTokenSource})
 
-	keys := NewAgnesKeyMonitor(logger, 3*time.Second)
+	keys := NewAgnesKeyMonitor(logger, 3*time.Second, settings.KeyFilePath)
 	keys.Start()
 	defer keys.Close()
 	connectivity, err := NewConnectivityMonitor(logger, 5*time.Second)
@@ -101,7 +92,14 @@ func runApplication(options commandLineOptions) error {
 	}
 	connectivity.Start()
 	defer connectivity.Close()
-	controller := NewProxyController(settings, paths, keys, logger, localToken)
+	recovery, recoveryErr := NewClashRecovery(paths, logger)
+	if recoveryErr != nil {
+		logger.Log("clash_recovery_unavailable", map[string]any{"error": recoveryErr})
+	}
+	controller, err := NewProxyController(settings, keys, connectivity, logger, localToken, recovery)
+	if err != nil {
+		return err
+	}
 	_ = controller.Start()
 	controller.RunMonitor()
 	defer controller.Close()

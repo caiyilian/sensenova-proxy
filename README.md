@@ -6,7 +6,7 @@ Lightweight local gateways for SenseNova and Agnes:
 - `opencode-pool-proxy.js` exposes an OpenAI-compatible endpoint for OpenCode, WorkBuddy, and similar clients, with automatic failover and per-model cooldowns.
 - `agnes-proxy.js` exposes an OpenAI-compatible Agnes endpoint with direct/Clash failover, guarded node recovery, and local rate-limit queuing.
 - `desktop/sensenova-pool/` contains the standalone Windows tray application for sharing the SenseNova pool with users who do not have Node.js installed.
-- `desktop/agnes-proxy/` contains a separate Windows tray controller that runs the tested Agnes gateway in the background without a terminal window.
+- `desktop/agnes-proxy/` contains the portable single-EXE Agnes tray gateway: API-key file hot reload, native retry/streaming, Clash 7890 failover, and embedded Liangxinyun node recovery, with no Node.js or repository dependency on the target PC.
 
 ## Why
 
@@ -252,13 +252,15 @@ The proxy passes the model name through to SenseNova as-is. Any model available 
 | `lib/agnes-gateway.js` | Agnes routing, guarded retry, streaming, and safe logging logic |
 | `lib/clash-recovery.js` | Bounded invocation of the existing Clash node helper |
 | `scripts/register-agnes-proxy-task.ps1` | Register/start the Agnes Windows logon task |
+| `desktop/agnes-proxy/` | Portable Windows Agnes gateway and tray UI; no external runtime required |
 | `sensenova_apikeys` | **Your real API keys (gitignored)** |
 | `sensenova_apikeys.example` | Example key file template |
 
 ## Requirements
 
-- Node.js 18.17+
-- SenseNova API key(s) from [platform.sensenova.cn](https://platform.sensenova.cn)
+- The JavaScript command-line gateways require Node.js 18.17+.
+- The portable Agnes desktop EXE requires Windows, Clash on `127.0.0.1:7890`, and an Agnes API-key file; it does not require Node.js or this repository.
+- SenseNova features require API key(s) from [platform.sensenova.cn](https://platform.sensenova.cn).
 
 ## License
 
