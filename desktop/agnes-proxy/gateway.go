@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -377,15 +378,35 @@ func (gateway *AgnesGateway) handleChat(response http.ResponseWriter, request *h
 
 		upstream := result.response
 		if upstream.StatusCode >= 200 && upstream.StatusCode < 300 {
-			gateway.rates.markHealthy(model, permit)
 			resetAgnesUpstreamResponseHeaders(response.Header())
 			response.Header().Set("X-Agnes-Route", result.route)
 			response.Header().Set("X-Agnes-Rate-Retries", strconv.Itoa(rateRetries))
 			copyAgnesResponseHeaders(response.Header(), upstream.Header)
-			bytesForwarded, streamErr := forwardAgnesStream(response, upstream.StatusCode, upstream.Body)
+			bytesForwarded, streamErr := forwardAgnesStream(response, upstream.StatusCode, upstream.Body, upstream.Header.Get("Content-Type"))
 			_ = upstream.Body.Close()
 			if streamErr != nil {
-				if bytesForwarded == 0 {
+				var payloadError *agnesStreamPayloadError
+				isPayloadError := errors.As(streamErr, &payloadError)
+				if bytesForwarded == 0 && isPayloadError && payloadError.category == "rate_limit" {
+					cooldown := gateway.rates.markLimited(model, parseAgnesRetryAfter(upstream.Header.Get("Retry-After")))
+					rateRetries++
+					gateway.counters.rateRetries.Add(1)
+					gateway.logger.Log("stream_rate_limit_queued", map[string]any{
+						"requestId": requestID,
+						"model":     model,
+						"route":     result.route,
+						"attempt":   rateRetries,
+						"waitMs":    cooldown.Milliseconds(),
+					})
+					continue
+				}
+				gateway.rates.releaseProbe(model, permit)
+				shouldRetry := bytesForwarded == 0 && (!isPayloadError || payloadError.retryable)
+				if shouldRetry {
+					if isPayloadError {
+						gateway.routes.markTransportFailure(result.route)
+						gateway.counters.routeFallbacks.Add(1)
+					}
 					networkRetries++
 					wait := agnesRetryBackoff(networkRetries)
 					if networkRetries <= 6 && time.Now().Add(wait).Before(deadline) {
@@ -426,6 +447,7 @@ func (gateway *AgnesGateway) handleChat(response http.ResponseWriter, request *h
 				}
 				return
 			}
+			gateway.rates.markHealthy(model, permit)
 			gateway.counters.successes.Add(1)
 			gateway.logger.Log("request_succeeded", map[string]any{
 				"requestId":  requestID,
@@ -515,6 +537,26 @@ type agnesUpstreamResult struct {
 	safeToRetry  bool
 }
 
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (body *cancelOnCloseReadCloser) Read(buffer []byte) (int, error) {
+	count, err := body.ReadCloser.Read(buffer)
+	if err != nil {
+		body.once.Do(body.cancel)
+	}
+	return count, err
+}
+
+func (body *cancelOnCloseReadCloser) Close() error {
+	err := body.ReadCloser.Close()
+	body.once.Do(body.cancel)
+	return err
+}
+
 func (gateway *AgnesGateway) fetchWithRoutes(ctx context.Context, incoming *http.Request, body []byte, apiKey, requestID, model string) agnesUpstreamResult {
 	var buffered []agnesUpstreamResult
 	var last agnesUpstreamResult
@@ -580,7 +622,6 @@ func (gateway *AgnesGateway) fetchWithRoutes(ctx context.Context, incoming *http
 
 func (gateway *AgnesGateway) fetchRoute(ctx context.Context, route string, incoming *http.Request, body []byte, apiKey string) agnesUpstreamResult {
 	attemptContext, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
 	target := *gateway.upstream
 	basePath := strings.TrimSuffix(gateway.upstream.Path, "/")
 	incomingPath := incoming.URL.Path
@@ -592,6 +633,7 @@ func (gateway *AgnesGateway) fetchRoute(ctx context.Context, route string, incom
 	target.RawQuery = incoming.URL.RawQuery
 	request, err := http.NewRequestWithContext(attemptContext, incoming.Method, target.String(), bytes.NewReader(body))
 	if err != nil {
+		cancel()
 		return agnesUpstreamResult{route: route, err: err}
 	}
 	copyAgnesRequestHeaders(request.Header, incoming.Header)
@@ -604,8 +646,13 @@ func (gateway *AgnesGateway) fetchRoute(ctx context.Context, route string, incom
 	}
 	upstream, err := client.Do(request)
 	if err != nil {
+		if upstream != nil && upstream.Body != nil {
+			_ = upstream.Body.Close()
+		}
+		cancel()
 		return agnesUpstreamResult{route: route, err: err}
 	}
+	upstream.Body = &cancelOnCloseReadCloser{ReadCloser: upstream.Body, cancel: cancel}
 	gateway.routes.markConnected(route)
 	return agnesUpstreamResult{response: upstream, route: route}
 }
@@ -920,7 +967,23 @@ func extractAgnesModel(body []byte) string {
 	return "unknown"
 }
 
-func forwardAgnesStream(response http.ResponseWriter, status int, body io.Reader) (int64, error) {
+type agnesStreamPayloadError struct {
+	category  string
+	retryable bool
+}
+
+func (streamError *agnesStreamPayloadError) Error() string {
+	return "Agnes event stream reported a " + streamError.category + " error"
+}
+
+func forwardAgnesStream(response http.ResponseWriter, status int, body io.Reader, contentType string) (int64, error) {
+	if strings.Contains(strings.ToLower(contentType), "text/event-stream") {
+		return forwardAgnesEventStream(response, status, body)
+	}
+	return forwardAgnesBody(response, status, body)
+}
+
+func forwardAgnesBody(response http.ResponseWriter, status int, body io.Reader) (int64, error) {
 	buffer := make([]byte, 32*1024)
 	flusher, canFlush := response.(http.Flusher)
 	var total int64
@@ -950,6 +1013,194 @@ func forwardAgnesStream(response http.ResponseWriter, status int, body io.Reader
 			return total, readErr
 		}
 	}
+}
+
+func forwardAgnesEventStream(response http.ResponseWriter, status int, body io.Reader) (int64, error) {
+	reader := bufio.NewReaderSize(body, 32*1024)
+	flusher, canFlush := response.(http.Flusher)
+	var event bytes.Buffer
+	var pending bytes.Buffer
+	var total int64
+	committed := false
+
+	forward := func(chunk []byte) error {
+		if !committed {
+			response.WriteHeader(status)
+			committed = true
+		}
+		if _, err := response.Write(chunk); err != nil {
+			return err
+		}
+		total += int64(len(chunk))
+		if canFlush {
+			flusher.Flush()
+		}
+		return nil
+	}
+
+	processEvent := func(chunk []byte) (bool, error) {
+		data, eventName, hasData := parseAgnesSSEEvent(chunk)
+		if !hasData {
+			if committed {
+				return false, forward(chunk)
+			}
+			_, _ = pending.Write(chunk)
+			return false, nil
+		}
+		trimmed := bytes.TrimSpace(data)
+		if bytes.Equal(trimmed, []byte("[DONE]")) {
+			if pending.Len() > 0 {
+				if err := forward(pending.Bytes()); err != nil {
+					return false, err
+				}
+				pending.Reset()
+			}
+			return true, forward(chunk)
+		}
+		if streamError := classifyAgnesSSEError(trimmed, eventName); streamError != nil {
+			return false, streamError
+		}
+		if isAgnesSSEProgress(trimmed) || pending.Len()+len(chunk) > 256*1024 {
+			if pending.Len() > 0 {
+				if err := forward(pending.Bytes()); err != nil {
+					return false, err
+				}
+				pending.Reset()
+			}
+			return false, forward(chunk)
+		}
+		_, _ = pending.Write(chunk)
+		return false, nil
+	}
+
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			_, _ = event.Write(line)
+			if len(bytes.TrimSpace(line)) == 0 {
+				done, eventErr := processEvent(event.Bytes())
+				event.Reset()
+				if eventErr != nil {
+					return total, eventErr
+				}
+				if done {
+					return total, nil
+				}
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				return total, readErr
+			}
+			if event.Len() > 0 {
+				done, eventErr := processEvent(event.Bytes())
+				if eventErr != nil {
+					return total, eventErr
+				}
+				if done {
+					return total, nil
+				}
+			}
+			return total, io.ErrUnexpectedEOF
+		}
+	}
+}
+
+func isAgnesSSEProgress(data []byte) bool {
+	var envelope struct {
+		Choices []struct {
+			Delta        map[string]json.RawMessage `json:"delta"`
+			Text         json.RawMessage            `json:"text"`
+			Message      json.RawMessage            `json:"message"`
+			FinishReason json.RawMessage            `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(data, &envelope) != nil {
+		return true
+	}
+	for _, choice := range envelope.Choices {
+		if meaningfulAgnesJSON(choice.Text) || meaningfulAgnesJSON(choice.Message) || meaningfulAgnesJSON(choice.FinishReason) {
+			return true
+		}
+		for name, value := range choice.Delta {
+			if !strings.EqualFold(name, "role") && meaningfulAgnesJSON(value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func meaningfulAgnesJSON(value json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(value)
+	return len(trimmed) > 0 &&
+		!bytes.Equal(trimmed, []byte("null")) &&
+		!bytes.Equal(trimmed, []byte(`""`)) &&
+		!bytes.Equal(trimmed, []byte("[]")) &&
+		!bytes.Equal(trimmed, []byte("{}"))
+}
+
+func parseAgnesSSEEvent(event []byte) (data []byte, eventName string, hasData bool) {
+	lines := bytes.Split(event, []byte{'\n'})
+	dataLines := make([][]byte, 0, 1)
+	for _, rawLine := range lines {
+		line := bytes.TrimSuffix(rawLine, []byte{'\r'})
+		switch {
+		case bytes.HasPrefix(line, []byte("data:")):
+			value := line[len("data:"):]
+			if len(value) > 0 && value[0] == ' ' {
+				value = value[1:]
+			}
+			dataLines = append(dataLines, value)
+			hasData = true
+		case bytes.HasPrefix(line, []byte("event:")):
+			eventName = strings.TrimSpace(string(line[len("event:"):]))
+		}
+	}
+	if hasData {
+		data = bytes.Join(dataLines, []byte{'\n'})
+	}
+	return data, eventName, hasData
+}
+
+func classifyAgnesSSEError(data []byte, eventName string) *agnesStreamPayloadError {
+	var envelope struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(data, &envelope) != nil {
+		if strings.EqualFold(eventName, "error") {
+			return &agnesStreamPayloadError{category: "upstream", retryable: true}
+		}
+		return nil
+	}
+	errorBody := bytes.TrimSpace(envelope.Error)
+	if len(errorBody) == 0 || bytes.Equal(errorBody, []byte("null")) {
+		if strings.EqualFold(eventName, "error") {
+			return &agnesStreamPayloadError{category: "upstream", retryable: true}
+		}
+		return nil
+	}
+
+	status := http.StatusInternalServerError
+	var details struct {
+		Code any    `json:"code"`
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(errorBody, &details) == nil {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(fmt.Sprint(details.Code))); err == nil && parsed >= 100 && parsed <= 599 {
+			status = parsed
+		}
+		kind := strings.ToLower(details.Type)
+		if strings.Contains(kind, "auth") || strings.Contains(kind, "permission") {
+			status = http.StatusUnauthorized
+		}
+	}
+	normalized := strings.ToLower(string(errorBody))
+	if strings.Contains(normalized, "invalid api key") || strings.Contains(normalized, "unauthorized") || strings.Contains(normalized, "authentication") {
+		status = http.StatusUnauthorized
+	}
+	category, retryable := classifyAgnesFailure(status, errorBody)
+	return &agnesStreamPayloadError{category: category, retryable: retryable}
 }
 
 func agnesRetryBackoff(attempt int) time.Duration {
