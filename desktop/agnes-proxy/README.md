@@ -31,6 +31,13 @@
 - 本地 API Key：`local-agnes-proxy`
 - 模型：`agnes-2.0-flash`、`agnes-2.5-flash`、`agnes-3.0-flash`
 
+主界面的“同步本机客户端”会检测当前用户的：
+
+- `%USERPROFILE%\.config\opencode\opencode.jsonc`
+- `%USERPROFILE%\.workbuddy\models.json`
+
+检测到 OpenCode 后，程序会新增或修正独立的 `agnes-proxy` provider，并保证三个 Agnes 模型存在；检测到 WorkBuddy 后，会新增或更新三个 `agnes-*` 模型项。同步采用增量合并，不删除或替换 `sensenova-pool`、SenseNova 模型以及其他来源的配置。发生修改前会分别创建 `.agnes-proxy.bak` 备份；如果同名 Agnes 模型 ID 明显属于其他来源，程序会停止修改该客户端并报告冲突。
+
 为了兼容这台电脑原有配置，若用户环境变量中已有 `AGNES_API_KEY`，尚未选择文件时仍可继续使用；文件一旦配置便优先于环境变量。若设置了 `AGNES_PROXY_LOCAL_TOKEN`，客户端连接令牌也会继续沿用该值。
 
 窗口右上角 `×` 只隐藏到托盘；真正退出请右键托盘图标选择“退出”。开机自启时直接进入托盘，但首次尚未配置文件时仍会显示界面。
@@ -38,7 +45,7 @@
 ## 构建
 
 ```powershell
-.\build.ps1 -Version 0.2.0
+.\build.ps1 -Version 0.2.1
 ```
 
 成品位于 `dist\AgnesProxy.exe`。

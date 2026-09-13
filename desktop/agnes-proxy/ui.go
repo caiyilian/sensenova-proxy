@@ -76,8 +76,8 @@ func (ui *DesktopUI) Run(startHidden bool) error {
 		Title:    appName,
 		Icon:     icon,
 		Visible:  false,
-		MinSize:  d.Size{Width: 740, Height: 600},
-		Size:     d.Size{Width: max(ui.settings.WindowWidth, 810), Height: max(ui.settings.WindowHeight, 670)},
+		MinSize:  d.Size{Width: 740, Height: 620},
+		Size:     d.Size{Width: max(ui.settings.WindowWidth, 810), Height: max(ui.settings.WindowHeight, 700)},
 		Layout: d.VBox{
 			Margins: d.Margins{Left: 16, Top: 14, Right: 16, Bottom: 14},
 			Spacing: 10,
@@ -131,6 +131,16 @@ func (ui *DesktopUI) Run(startHidden bool) error {
 					d.Label{Text: "本地 API Key"},
 					d.LineEdit{AssignTo: &ui.localTokenEdit, ReadOnly: true, StretchFactor: 1},
 					d.PushButton{Text: "复制", MinSize: d.Size{Width: 62}, OnClicked: func() { ui.copyText(ui.localTokenEdit.Text(), "本地 API Key") }},
+					d.Label{Text: "客户端配置"},
+					d.Composite{
+						ColumnSpan:    2,
+						Layout:        d.HBox{MarginsZero: true, Spacing: 7},
+						StretchFactor: 1,
+						Children: []d.Widget{
+							d.PushButton{Text: "同步本机客户端", MinSize: d.Size{Width: 152}, OnClicked: ui.syncLocalClients},
+							d.HSpacer{},
+						},
+					},
 				},
 			},
 			d.Label{Text: "模型：agnes-2.0-flash · agnes-2.5-flash · agnes-3.0-flash"},
@@ -315,6 +325,65 @@ func (ui *DesktopUI) refreshKey() {
 	} else if ui.notifyIcon != nil {
 		_ = ui.notifyIcon.ShowInfo(appName, "API Key 文件已重新读取，内容未发生变化")
 	}
+}
+
+func (ui *DesktopUI) syncLocalClients() {
+	openCodePath, err := defaultOpenCodeConfigPath()
+	if err != nil {
+		walk.MsgBox(ui.mainWindow, appName, "无法确定 OpenCode 配置位置：\n"+redactText(err.Error()), walk.MsgBoxIconError)
+		return
+	}
+	workBuddyPath, err := defaultWorkBuddyModelsPath()
+	if err != nil {
+		walk.MsgBox(ui.mainWindow, appName, "无法确定 WorkBuddy 配置位置：\n"+redactText(err.Error()), walk.MsgBoxIconError)
+		return
+	}
+
+	result := syncDetectedLocalClients(openCodePath, workBuddyPath, ui.settings.Port, ui.localToken)
+	ui.logger.Log("local_clients_synced", map[string]any{
+		"opencode_detected":  result.OpenCode.Detected,
+		"opencode_success":   result.OpenCode.Detected && result.OpenCode.Err == nil,
+		"opencode_added":     result.OpenCode.Added,
+		"opencode_updated":   result.OpenCode.Updated,
+		"workbuddy_detected": result.WorkBuddy.Detected,
+		"workbuddy_success":  result.WorkBuddy.Detected && result.WorkBuddy.Err == nil,
+		"workbuddy_added":    result.WorkBuddy.Added,
+		"workbuddy_updated":  result.WorkBuddy.Updated,
+	})
+	if result.DetectedCount() == 0 && result.Err() == nil {
+		walk.MsgBox(ui.mainWindow, appName, "没有发现 OpenCode 或 WorkBuddy 的本机配置目录，因此没有需要同步的客户端。\n\n请先启动并初始化客户端后再试。", walk.MsgBoxIconInformation)
+		return
+	}
+
+	var sections []string
+	for _, outcome := range []LocalClientSyncOutcome{result.OpenCode, result.WorkBuddy} {
+		if outcome.Err != nil {
+			sections = append(sections, outcome.Name+"：同步失败\n"+redactText(outcome.Err.Error()))
+			continue
+		}
+		if !outcome.Detected {
+			continue
+		}
+		section := outcome.Name + "：已同步\n" + outcome.Path
+		if outcome.Name == "OpenCode" {
+			section += fmt.Sprintf("\n新增 provider：%d；更新 provider：%d；无需修改：%d。", outcome.Added, outcome.Updated, outcome.Unchanged)
+		} else {
+			section += fmt.Sprintf("\n新增模型：%d；更新模型：%d；无需修改：%d。", outcome.Added, outcome.Updated, outcome.Unchanged)
+		}
+		if outcome.BackupPath != "" {
+			section += "\n备份：" + outcome.BackupPath
+		}
+		sections = append(sections, section)
+	}
+	message := strings.Join(sections, "\n\n")
+	icon := walk.MsgBoxIconInformation
+	if result.Err() != nil {
+		message += "\n\n其余客户端不受失败项影响；SenseNova 及其他模型均不会被删除。"
+		icon = walk.MsgBoxIconWarning
+	} else {
+		message += "\n\n只同步了 Agnes 项，SenseNova 及其他模型均已保留。若客户端已经打开，请重新启动客户端。"
+	}
+	walk.MsgBox(ui.mainWindow, appName, message, icon)
 }
 
 func (ui *DesktopUI) autoStartChanged() {

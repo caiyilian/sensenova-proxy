@@ -12,11 +12,13 @@ import (
 var version = "dev"
 
 type commandLineOptions struct {
-	autoStart bool
-	hidden    bool
-	dataDir   string
-	keyFile   string
-	port      int
+	autoStart        bool
+	hidden           bool
+	syncLocalClients bool
+	syncOpenCode     bool
+	dataDir          string
+	keyFile          string
+	port             int
 }
 
 func main() {
@@ -31,6 +33,8 @@ func parseCommandLine() commandLineOptions {
 	options := commandLineOptions{port: -1}
 	flag.BoolVar(&options.autoStart, "autostart", false, "start hidden from the current-user startup entry")
 	flag.BoolVar(&options.hidden, "hidden", false, "start hidden in the notification area")
+	flag.BoolVar(&options.syncLocalClients, "sync-local-clients", false, "detect and synchronize installed OpenCode and WorkBuddy clients")
+	flag.BoolVar(&options.syncOpenCode, "sync-opencode", false, "synchronize the current local token to the user's OpenCode config")
 	flag.StringVar(&options.dataDir, "data-dir", "", "override the settings and log directory")
 	flag.StringVar(&options.keyFile, "key-file", "", "override the Agnes API key file")
 	flag.IntVar(&options.port, "port", -1, "override the local listening port")
@@ -82,6 +86,43 @@ func runApplication(options commandLineOptions) error {
 	})
 	localToken, localTokenSource := readAgnesLocalToken()
 	logger.Log("local_gateway_token_selected", map[string]any{"source": localTokenSource})
+	if options.syncLocalClients {
+		openCodePath, pathErr := defaultOpenCodeConfigPath()
+		if pathErr != nil {
+			return pathErr
+		}
+		modelsPath, pathErr := defaultWorkBuddyModelsPath()
+		if pathErr != nil {
+			return pathErr
+		}
+		result := syncDetectedLocalClients(openCodePath, modelsPath, settings.Port, localToken)
+		logger.Log("local_clients_synced", map[string]any{
+			"opencode_detected":  result.OpenCode.Detected,
+			"opencode_success":   result.OpenCode.Detected && result.OpenCode.Err == nil,
+			"workbuddy_detected": result.WorkBuddy.Detected,
+			"workbuddy_success":  result.WorkBuddy.Detected && result.WorkBuddy.Err == nil,
+			"workbuddy_added":    result.WorkBuddy.Added,
+			"workbuddy_updated":  result.WorkBuddy.Updated,
+			"source":             "command_line",
+		})
+		if syncErr := result.Err(); syncErr != nil {
+			return syncErr
+		}
+	} else if options.syncOpenCode {
+		configPath, pathErr := defaultOpenCodeConfigPath()
+		if pathErr != nil {
+			return pathErr
+		}
+		result, syncErr := syncAgnesOpenCodeConfig(configPath, agnesLocalBaseURL(settings.Port), localToken)
+		if syncErr != nil {
+			return syncErr
+		}
+		logger.Log("opencode_config_synced", map[string]any{
+			"created": result.Created,
+			"updated": result.Updated,
+			"source":  "command_line",
+		})
+	}
 
 	keys := NewAgnesKeyMonitor(logger, 3*time.Second, settings.KeyFilePath)
 	keys.Start()
