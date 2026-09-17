@@ -30,7 +30,6 @@ var supportedModels = []string{
 }
 
 const (
-	defaultImageInspectionRetryLimit     = 2
 	defaultImageInspectionRetryBaseDelay = 750 * time.Millisecond
 )
 
@@ -88,7 +87,6 @@ type Gateway struct {
 	upstreamBase                  *url.URL
 	maxQueue                      time.Duration
 	probeInterval                 time.Duration
-	imageInspectionRetryLimit     int
 	imageInspectionRetryBaseDelay time.Duration
 	startedAt                     time.Time
 	stats                         gatewayStats
@@ -126,7 +124,6 @@ func NewGateway(
 		upstreamBase:                  upstreamBase,
 		maxQueue:                      10 * time.Minute,
 		probeInterval:                 5 * time.Second,
-		imageInspectionRetryLimit:     defaultImageInspectionRetryLimit,
 		imageInspectionRetryBaseDelay: defaultImageInspectionRetryBaseDelay,
 		startedAt:                     time.Now(),
 	}, nil
@@ -326,8 +323,15 @@ func (gateway *Gateway) handleChat(response http.ResponseWriter, request *http.R
 	nextProbeAt := time.Time{}
 	lastCategory := "pool_unavailable"
 	imageInspectionRetries := 0
+	inspectionFailed := make(map[string]bool)
+	var rejectInspection func()
 
 	for request.Context().Err() == nil {
+		// Bound new attempts even while a growing pool never completes a sweep.
+		if attempts > 0 && time.Since(startedAt) >= gateway.maxQueue {
+			gateway.failUnavailable(response, requestID, model, attempts, lastCategory, startedAt)
+			return
+		}
 		if completedSweep && !nextProbeAt.IsZero() && time.Now().Before(nextProbeAt) {
 			remaining := gateway.maxQueue - time.Since(startedAt)
 			if remaining <= 0 {
@@ -359,13 +363,18 @@ func (gateway *Gateway) handleChat(response http.ResponseWriter, request *http.R
 			return
 		}
 
-		account, available := gateway.pool.Pick(accounts, model, attempted)
+		candidates := inspectionCandidates(accounts, inspectionFailed)
+		if len(candidates) == 0 && rejectInspection != nil {
+			rejectInspection()
+			return
+		}
+		account, available := gateway.pool.Pick(candidates, model, attempted)
 		if !available {
 			if attempts > 0 {
 				completedSweep = true
 			}
 			clear(attempted)
-			nextReady, hasNext := gateway.pool.NextReadyAt(accounts, model)
+			nextReady, hasNext := gateway.pool.NextReadyAt(candidates, model)
 			remaining := gateway.maxQueue - time.Since(startedAt)
 			wait := remaining + time.Millisecond
 			if hasNext {
@@ -461,15 +470,16 @@ func (gateway *Gateway) handleChat(response http.ResponseWriter, request *http.R
 		retryExhausted := false
 		retryDelay := time.Duration(0)
 		if class.Category == "image_inspection" {
-			if imageInspectionRetries >= gateway.imageInspectionRetryLimit {
+			inspectionFailed[account.Fingerprint] = true
+			if len(inspectionCandidates(gateway.keyStore.Accounts(), inspectionFailed)) == 0 {
 				class.Retryable = false
 				retryExhausted = true
 			} else {
 				imageInspectionRetries++
-				retryDelay = gateway.imageInspectionRetryBaseDelay * time.Duration(1<<(imageInspectionRetries-1))
+				retryDelay = min(5*time.Second, gateway.imageInspectionRetryBaseDelay*time.Duration(1<<min(imageInspectionRetries-1, 3)))
 			}
 		}
-		if !class.Retryable {
+		reject := func() {
 			gateway.stats.failures.Add(1)
 			fields := accountLogFields(account, map[string]any{
 				"requestId":  requestID,
@@ -481,7 +491,9 @@ func (gateway *Gateway) handleChat(response http.ResponseWriter, request *http.R
 			})
 			if class.Category == "image_inspection" {
 				fields["transientRetries"] = imageInspectionRetries
-				fields["retryExhausted"] = retryExhausted
+				fields["retryExhausted"] = true
+				fields["accountCount"] = len(gateway.keyStore.Accounts())
+				fields["inspectionFailedAccounts"] = len(inspectionFailed)
 			}
 			gateway.logger.Log("request_rejected", fields)
 			copyResponseHeaders(response.Header(), upstream.Header)
@@ -489,7 +501,13 @@ func (gateway *Gateway) handleChat(response http.ResponseWriter, request *http.R
 			response.Header().Set("X-SenseNova-Pool-Attempts", strconv.Itoa(attempts))
 			response.WriteHeader(upstream.StatusCode)
 			_, _ = response.Write(failureBody)
+		}
+		if !class.Retryable || retryExhausted {
+			reject()
 			return
+		}
+		if class.Category == "image_inspection" {
+			rejectInspection = reject
 		}
 
 		cooldown := gateway.pool.MarkFailure(
@@ -516,6 +534,8 @@ func (gateway *Gateway) handleChat(response http.ResponseWriter, request *http.R
 		if class.Category == "image_inspection" {
 			fields["transientRetry"] = imageInspectionRetries
 			fields["retryDelayMs"] = retryDelay.Milliseconds()
+			fields["accountCount"] = len(gateway.keyStore.Accounts())
+			fields["inspectionFailedAccounts"] = len(inspectionFailed)
 		}
 		gateway.logger.Log(event, fields)
 		if retryDelay > 0 && !sleepContext(request.Context(), retryDelay) {
@@ -528,6 +548,18 @@ func (gateway *Gateway) handleChat(response http.ResponseWriter, request *http.R
 		}
 	}
 	gateway.stats.canceled.Add(1)
+}
+
+// A request must not revisit an account that already rejected its images.
+// Recompute against the live pool so additions and removals take effect mid-request.
+func inspectionCandidates(accounts []Account, failed map[string]bool) []Account {
+	candidates := make([]Account, 0, len(accounts))
+	for _, account := range accounts {
+		if !failed[account.Fingerprint] {
+			candidates = append(candidates, account)
+		}
+	}
+	return candidates
 }
 
 func (gateway *Gateway) sendUpstream(request *http.Request, body []byte, account Account) (*http.Response, error) {

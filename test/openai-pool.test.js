@@ -193,12 +193,14 @@ test('gateway retries a rate-limited key and streams only the successful respons
   assert.equal(events.some((event) => event.event === 'request_succeeded'), true);
 });
 
-test('gateway retries only twice for transient image-inspection HTTP 400 responses', async (t) => {
+test('image-inspection retries expand from 19 to 23 live accounts without revisiting failures', async (t) => {
   const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sensenova-image-inspection-'));
   const keyFilePath = path.join(temporaryDir, 'keys');
-  fs.writeFileSync(keyFilePath, `${KEY_ONE}\n${KEY_TWO}\n${KEY_THREE}\n`, 'utf8');
+  const keys = Array.from({ length: 23 }, (_, i) => `sk-${String(i).padStart(32, '0')}`);
+  fs.writeFileSync(keyFilePath, keys.slice(0, 19).join('\n'), 'utf8');
   const events = [];
   let attempts = 0;
+  const seen = new Set();
   const gateway = createGateway({
     keyFilePath,
     logDir: path.join(temporaryDir, 'logs'),
@@ -207,8 +209,12 @@ test('gateway retries only twice for transient image-inspection HTTP 400 respons
     requestTimeoutMs: 2_000,
     imageInspectionRetryBaseDelayMs: 0,
     logger: (event) => events.push(event),
-    fetchImpl: async () => {
+    fetchImpl: async (_url, options) => {
       attempts += 1;
+      const key = options.headers.get('authorization');
+      assert.equal(seen.has(key), false);
+      seen.add(key);
+      if (attempts === 1) fs.writeFileSync(keyFilePath, keys.join('\n'), 'utf8');
       return new Response(JSON.stringify({
         error: {
           message: 'image call nova inspection failed rpc error: code = Internal desc = internal error',
@@ -239,11 +245,12 @@ test('gateway retries only twice for transient image-inspection HTTP 400 respons
   );
 
   assert.equal(response.status, 400);
-  assert.equal(response.headers.get('x-sensenova-pool-attempts'), '3');
-  assert.equal(attempts, 3);
+  assert.equal(response.headers.get('x-sensenova-pool-attempts'), '23');
+  assert.equal(attempts, 23);
+  assert.equal(seen.size, 23);
   assert.equal(
     events.filter((event) => event.event === 'upstream_retry' && event.category === 'image_inspection').length,
-    2,
+    22,
   );
   assert.equal(
     events.some((event) => event.event === 'request_rejected' && event.retryExhausted === true),

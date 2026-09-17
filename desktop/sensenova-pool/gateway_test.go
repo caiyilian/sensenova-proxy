@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -114,23 +115,38 @@ func TestGatewayRetriesAnotherAccountWithoutLoggingSecrets(t *testing.T) {
 
 func TestGatewayBoundsTransientImageInspectionRetries(t *testing.T) {
 	tests := []struct {
-		name         string
-		succeedOn    int32
-		wantStatus   int
-		wantAttempts int32
+		name            string
+		succeedOn       int32
+		wantStatus      int
+		wantAttempts    int32
+		accountCount    int
+		reloadCount     int
+		deadlineExpired bool
 	}{
-		{name: "third attempt succeeds", succeedOn: 3, wantStatus: http.StatusOK, wantAttempts: 3},
-		{name: "two retries exhausted", wantStatus: http.StatusBadRequest, wantAttempts: 3},
+		{name: "third attempt succeeds", accountCount: 3, succeedOn: 3, wantStatus: http.StatusOK, wantAttempts: 3},
+		{name: "three accounts exhausted", accountCount: 3, wantStatus: http.StatusBadRequest, wantAttempts: 3},
+		{name: "nineteenth account succeeds", accountCount: 19, succeedOn: 19, wantStatus: http.StatusOK, wantAttempts: 19},
+		{name: "nineteen accounts exhausted", accountCount: 19, wantStatus: http.StatusBadRequest, wantAttempts: 19},
+		{name: "hot addition during retry", accountCount: 3, reloadCount: 23, succeedOn: 23, wantStatus: http.StatusOK, wantAttempts: 23},
+		{name: "hot removal during retry", accountCount: 19, reloadCount: 4, wantStatus: http.StatusBadRequest, wantAttempts: 4},
+		{name: "single account exhausted", accountCount: 1, wantStatus: http.StatusBadRequest, wantAttempts: 1},
+		{name: "deadline bounds a large first sweep", accountCount: 19, deadlineExpired: true, wantStatus: http.StatusServiceUnavailable, wantAttempts: 1},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			tempDir := t.TempDir()
 			keyPath := filepath.Join(tempDir, "keys.txt")
-			keys := []string{fakeKey("i"), fakeKey("j"), fakeKey("k")}
-			if err := os.WriteFile(keyPath, []byte(strings.Join(keys, "\n")+"\n"), 0o600); err != nil {
-				t.Fatal(err)
+			writeKeys := func(count int) {
+				keys := make([]string, count)
+				for i := range keys {
+					keys[i] = fakeKey(string(rune('a' + i)))
+				}
+				if err := os.WriteFile(keyPath, []byte(strings.Join(keys, "\n")+"\n"), 0o600); err != nil {
+					t.Error(err)
+				}
 			}
+			writeKeys(test.accountCount)
 			logger, err := NewJSONLLogger(filepath.Join(tempDir, "logs"))
 			if err != nil {
 				t.Fatal(err)
@@ -139,8 +155,18 @@ func TestGatewayBoundsTransientImageInspectionRetries(t *testing.T) {
 			store.Reload("test")
 
 			var requests atomic.Int32
+			seen := make(map[string]bool)
 			upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 				attempt := requests.Add(1)
+				key := request.Header.Get("Authorization")
+				if seen[key] {
+					t.Error("same image-rejecting account retried")
+				}
+				seen[key] = true
+				if attempt == 1 && test.reloadCount > 0 {
+					writeKeys(test.reloadCount)
+					store.Reload("test-hot-reload")
+				}
 				if test.succeedOn > 0 && attempt == test.succeedOn {
 					response.Header().Set("Content-Type", "application/json")
 					_, _ = response.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
@@ -159,6 +185,9 @@ func TestGatewayBoundsTransientImageInspectionRetries(t *testing.T) {
 			gateway.upstreamBase = upstreamURL
 			gateway.client = upstream.Client()
 			gateway.imageInspectionRetryBaseDelay = 0
+			if test.deadlineExpired {
+				gateway.maxQueue = time.Nanosecond
+			}
 
 			recorder := httptest.NewRecorder()
 			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kimi-k3","messages":[{"role":"user","content":"hello"}]}`))
@@ -170,11 +199,15 @@ func TestGatewayBoundsTransientImageInspectionRetries(t *testing.T) {
 			if got := requests.Load(); got != test.wantAttempts {
 				t.Fatalf("upstream attempts = %d, want %d", got, test.wantAttempts)
 			}
-			if recorder.Header().Get("X-SenseNova-Pool-Attempts") != "3" {
-				t.Fatalf("attempt header = %q, want 3", recorder.Header().Get("X-SenseNova-Pool-Attempts"))
+			if recorder.Header().Get("X-SenseNova-Pool-Attempts") != strconv.Itoa(int(test.wantAttempts)) {
+				t.Fatalf("attempt header = %q, want %d", recorder.Header().Get("X-SenseNova-Pool-Attempts"), test.wantAttempts)
 			}
 			logText := readAllLogs(t, logger.Dir())
-			if strings.Count(logText, `"event":"upstream_retry"`) != int(test.wantAttempts-1) {
+			wantRetries := int(test.wantAttempts - 1)
+			if test.deadlineExpired {
+				wantRetries = int(test.wantAttempts)
+			}
+			if strings.Count(logText, `"event":"upstream_retry"`) != wantRetries {
 				t.Fatalf("unexpected upstream retry log count: %s", logText)
 			}
 			if test.wantStatus == http.StatusBadRequest && !strings.Contains(logText, `"retryExhausted":true`) {

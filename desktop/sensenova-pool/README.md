@@ -37,7 +37,9 @@ Windows 防火墙可能为新 EXE 自动创建入站“阻止”规则。远端�
 
 日志位于 `%LOCALAPPDATA%\SenseNovaPool\logs`，主界面可直接打开。日志只记录请求结果、模型、账号序号、Key 的单向短指纹和冷却状态，不记录完整 Key、提示词或模型回复。
 
-SenseNova 偶发把图像检查服务的内部故障作为 HTTP 400 返回。程序会只识别 `image call nova inspection failed ... internal error` 这一明确特征，换账号并最多重试 2 次（短暂退避）；普通 HTTP 400 仍会原样返回。日志中的 `category: image_inspection`、`transientRetry` 和 `retryExhausted` 可用于确认重试过程。
+SenseNova 偶发把图像检查服务的内部故障作为 HTTP 400 返回。程序识别 `image call nova inspection failed ... internal error` 后，按实时账号池换账号：同一个请求中已返回该错误的 Key 不会再用，19 个账号可依次尝试，全部失败才返回原始 400。文件热更新后，新 Key 加入后续调度，移除的 Key 不再尝试；单账号池遇到此错误会直接返回。退避为 750ms、1.5s、3s，之后上限 5s。日志记录 `category: image_inspection`、`accountCount`、`inspectionFailedAccounts`、`transientRetry` 和 `retryExhausted`，不记录 Key 正文。
+
+TPM/RPM、额度不足、鉴权错误、HTTP 408/425/5xx 和连接故障均按实时账号池轮换，并按各自冷却时间跳过账号。限流账号冷却后可以再次尝试，不以账号总数作为全局次数上限；开始请求约 10 分钟后停止启动新的尝试（正在进行的上游请求/成功流不因此被截断）。普通参数错误 400 直接返回；已经传给客户端的流中途断开时不会重放，以免重复输出或工具调用。
 
 “关于 / 许可”窗口包含随单个 EXE 一起嵌入的第三方许可说明，因此分发时不需要额外附带许可文件。
 
@@ -46,7 +48,7 @@ SenseNova 偶发把图像检查服务的内部故障作为 HTTP 400 返回。程
 在 Windows PowerShell 中运行：
 
 ```powershell
-.\build.ps1 -Version 0.2.3
+.\build.ps1 -Version 0.2.4
 ```
 
 构建脚本会先执行测试，再嵌入 Windows Common Controls 清单，最后生成 `dist\SenseNovaPool.exe`。需要 Go 1.24 或兼容版本；最终 EXE 本身不要求目标电脑安装 Go。
