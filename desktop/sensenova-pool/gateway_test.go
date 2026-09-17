@@ -112,6 +112,78 @@ func TestGatewayRetriesAnotherAccountWithoutLoggingSecrets(t *testing.T) {
 	}
 }
 
+func TestGatewayBoundsTransientImageInspectionRetries(t *testing.T) {
+	tests := []struct {
+		name         string
+		succeedOn    int32
+		wantStatus   int
+		wantAttempts int32
+	}{
+		{name: "third attempt succeeds", succeedOn: 3, wantStatus: http.StatusOK, wantAttempts: 3},
+		{name: "two retries exhausted", wantStatus: http.StatusBadRequest, wantAttempts: 3},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			keyPath := filepath.Join(tempDir, "keys.txt")
+			keys := []string{fakeKey("i"), fakeKey("j"), fakeKey("k")}
+			if err := os.WriteFile(keyPath, []byte(strings.Join(keys, "\n")+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			logger, err := NewJSONLLogger(filepath.Join(tempDir, "logs"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := NewKeyStore(keyPath, logger, time.Second)
+			store.Reload("test")
+
+			var requests atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				attempt := requests.Add(1)
+				if test.succeedOn > 0 && attempt == test.succeedOn {
+					response.Header().Set("Content-Type", "application/json")
+					_, _ = response.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+					return
+				}
+				response.WriteHeader(http.StatusBadRequest)
+				_, _ = response.Write([]byte(`{"error":{"message":"image call nova inspection failed rpc error: code = Internal desc = internal error (trace-id)"}}`))
+			}))
+			defer upstream.Close()
+
+			gateway, err := NewGateway(store, NewAccountPool(), logger, fixedNetworkStatus{NetworkStatus{Known: true, Online: true, Route: "test"}}, &ProxyResolver{}, "local-test-token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			upstreamURL, _ := url.Parse(upstream.URL + "/v1/")
+			gateway.upstreamBase = upstreamURL
+			gateway.client = upstream.Client()
+			gateway.imageInspectionRetryBaseDelay = 0
+
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kimi-k3","messages":[{"role":"user","content":"hello"}]}`))
+			gateway.handleChat(recorder, request)
+
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", recorder.Code, test.wantStatus, recorder.Body.String())
+			}
+			if got := requests.Load(); got != test.wantAttempts {
+				t.Fatalf("upstream attempts = %d, want %d", got, test.wantAttempts)
+			}
+			if recorder.Header().Get("X-SenseNova-Pool-Attempts") != "3" {
+				t.Fatalf("attempt header = %q, want 3", recorder.Header().Get("X-SenseNova-Pool-Attempts"))
+			}
+			logText := readAllLogs(t, logger.Dir())
+			if strings.Count(logText, `"event":"upstream_retry"`) != int(test.wantAttempts-1) {
+				t.Fatalf("unexpected upstream retry log count: %s", logText)
+			}
+			if test.wantStatus == http.StatusBadRequest && !strings.Contains(logText, `"retryExhausted":true`) {
+				t.Fatal("retry exhaustion was not recorded")
+			}
+		})
+	}
+}
+
 func TestGatewayBlocksWhileConnectivityMonitorIsOffline(t *testing.T) {
 	tempDir := t.TempDir()
 	logger, err := NewJSONLLogger(filepath.Join(tempDir, "logs"))

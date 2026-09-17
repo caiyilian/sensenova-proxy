@@ -30,9 +30,10 @@ type cooldownState struct {
 }
 
 var (
-	rateLimitPattern = regexp.MustCompile(`(?i)tpm|rpm|rate.?limit|too many requests|inference exceeds|request frequency|限流|频率`)
-	quotaPattern     = regexp.MustCompile(`(?i)token plan entitlement exhausted|entitlement exhausted|quota|insufficient (?:balance|credit)|balance exhausted|credits? exhausted|额度|余额不足`)
-	authPattern      = regexp.MustCompile(`(?i)invalid api.?key|authentication|unauthori[sz]ed|forbidden|鉴权|认证失败`)
+	rateLimitPattern       = regexp.MustCompile(`(?i)tpm|rpm|rate.?limit|too many requests|inference exceeds|request frequency|限流|频率`)
+	quotaPattern           = regexp.MustCompile(`(?i)token plan entitlement exhausted|entitlement exhausted|quota|insufficient (?:balance|credit)|balance exhausted|credits? exhausted|额度|余额不足`)
+	authPattern            = regexp.MustCompile(`(?i)invalid api.?key|authentication|unauthori[sz]ed|forbidden|鉴权|认证失败`)
+	imageInspectionPattern = regexp.MustCompile(`(?i)image call nova inspection failed.*(?:rpc error|internal error)`)
 )
 
 type AccountPool struct {
@@ -48,10 +49,11 @@ func NewAccountPool() *AccountPool {
 		inFlight:     make(map[string]int),
 		failureState: make(map[string]cooldownState),
 		cooldowns: map[string]cooldownSettings{
-			"rate_limit": {Base: time.Minute, Max: 5 * time.Minute, Exponential: false},
-			"quota":      {Base: 30 * time.Minute, Max: 5 * time.Hour, Exponential: true},
-			"auth":       {Base: 24 * time.Hour, Max: 24 * time.Hour, Exponential: false},
-			"upstream":   {Base: 5 * time.Second, Max: 2 * time.Minute, Exponential: true},
+			"rate_limit":       {Base: time.Minute, Max: 5 * time.Minute, Exponential: false},
+			"quota":            {Base: 30 * time.Minute, Max: 5 * time.Hour, Exponential: true},
+			"auth":             {Base: 24 * time.Hour, Max: 24 * time.Hour, Exponential: false},
+			"upstream":         {Base: 5 * time.Second, Max: 2 * time.Minute, Exponential: true},
+			"image_inspection": {Base: 5 * time.Second, Max: 15 * time.Second, Exponential: true},
 		},
 	}
 }
@@ -253,6 +255,9 @@ func classifyFailure(statusCode int, body string) failureClass {
 	}
 	if statusCode == 401 || statusCode == 403 || authPattern.MatchString(body) {
 		return failureClass{Category: "auth", Retryable: true, Scope: "account"}
+	}
+	if statusCode == http.StatusBadRequest && imageInspectionPattern.MatchString(body) {
+		return failureClass{Category: "image_inspection", Retryable: true, Scope: "model"}
 	}
 	if statusCode == 408 || statusCode == 425 || statusCode >= 500 {
 		return failureClass{Category: "upstream", Retryable: true, Scope: "model"}

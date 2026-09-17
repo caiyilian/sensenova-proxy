@@ -96,6 +96,10 @@ test('classifyFailure recognizes SenseNova retryable failures', () => {
   assert.equal(classifyFailure(429, 'token plan entitlement exhausted').category, 'quota');
   assert.equal(classifyFailure(401, 'bad key').category, 'auth');
   assert.equal(classifyFailure(503, 'temporary').category, 'upstream');
+  assert.deepEqual(
+    classifyFailure(400, 'image call nova inspection failed rpc error: code = Internal desc = internal error'),
+    { category: 'image_inspection', retryable: true, scope: 'model' },
+  );
   assert.equal(classifyFailure(400, 'invalid arguments').retryable, false);
 });
 
@@ -187,6 +191,64 @@ test('gateway retries a rate-limited key and streams only the successful respons
   assert.equal(attempts.every((item) => item.body.includes('deepseek-v4-flash')), true);
   assert.equal(events.some((event) => event.event === 'upstream_retry'), true);
   assert.equal(events.some((event) => event.event === 'request_succeeded'), true);
+});
+
+test('gateway retries only twice for transient image-inspection HTTP 400 responses', async (t) => {
+  const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sensenova-image-inspection-'));
+  const keyFilePath = path.join(temporaryDir, 'keys');
+  fs.writeFileSync(keyFilePath, `${KEY_ONE}\n${KEY_TWO}\n${KEY_THREE}\n`, 'utf8');
+  const events = [];
+  let attempts = 0;
+  const gateway = createGateway({
+    keyFilePath,
+    logDir: path.join(temporaryDir, 'logs'),
+    localToken: 'test-token',
+    maxQueueMs: 500,
+    requestTimeoutMs: 2_000,
+    imageInspectionRetryBaseDelayMs: 0,
+    logger: (event) => events.push(event),
+    fetchImpl: async () => {
+      attempts += 1;
+      return new Response(JSON.stringify({
+        error: {
+          message: 'image call nova inspection failed rpc error: code = Internal desc = internal error',
+        },
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+  const gatewayAddress = await gateway.listen(0);
+
+  t.after(async () => {
+    await gateway.close();
+    fs.rmSync(temporaryDir, { recursive: true, force: true });
+  });
+
+  const response = await fetch(
+    `http://127.0.0.1:${gatewayAddress.port}/v1/chat/completions`,
+    {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer test-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ model: 'kimi-k3', messages: [{ role: 'user', content: 'hello' }] }),
+    },
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(response.headers.get('x-sensenova-pool-attempts'), '3');
+  assert.equal(attempts, 3);
+  assert.equal(
+    events.filter((event) => event.event === 'upstream_retry' && event.category === 'image_inspection').length,
+    2,
+  );
+  assert.equal(
+    events.some((event) => event.event === 'request_rejected' && event.retryExhausted === true),
+    true,
+  );
 });
 
 test('gateway paces retries after a request has exhausted the whole pool', async (t) => {

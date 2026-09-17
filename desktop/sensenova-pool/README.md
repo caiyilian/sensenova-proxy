@@ -37,6 +37,8 @@ Windows 防火墙可能为新 EXE 自动创建入站“阻止”规则。远端�
 
 日志位于 `%LOCALAPPDATA%\SenseNovaPool\logs`，主界面可直接打开。日志只记录请求结果、模型、账号序号、Key 的单向短指纹和冷却状态，不记录完整 Key、提示词或模型回复。
 
+SenseNova 偶发把图像检查服务的内部故障作为 HTTP 400 返回。程序会只识别 `image call nova inspection failed ... internal error` 这一明确特征，换账号并最多重试 2 次（短暂退避）；普通 HTTP 400 仍会原样返回。日志中的 `category: image_inspection`、`transientRetry` 和 `retryExhausted` 可用于确认重试过程。
+
 “关于 / 许可”窗口包含随单个 EXE 一起嵌入的第三方许可说明，因此分发时不需要额外附带许可文件。
 
 ## 本地构建
@@ -44,7 +46,7 @@ Windows 防火墙可能为新 EXE 自动创建入站“阻止”规则。远端�
 在 Windows PowerShell 中运行：
 
 ```powershell
-.\build.ps1 -Version 0.2.2
+.\build.ps1 -Version 0.2.3
 ```
 
 构建脚本会先执行测试，再嵌入 Windows Common Controls 清单，最后生成 `dist\SenseNovaPool.exe`。需要 Go 1.24 或兼容版本；最终 EXE 本身不要求目标电脑安装 Go。

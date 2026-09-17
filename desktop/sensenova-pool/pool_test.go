@@ -56,6 +56,13 @@ func TestFailureClassificationAndRetryAfter(t *testing.T) {
 	if class := classifyFailure(http.StatusUnauthorized, `{"error":"invalid api key"}`); class.Category != "auth" || class.Scope != "account" {
 		t.Fatalf("unexpected auth class: %+v", class)
 	}
+	inspectionError := `{"error":{"message":"image call nova inspection failed rpc error: code = Internal desc = internal error (trace-id)"}}`
+	if class := classifyFailure(http.StatusBadRequest, inspectionError); class.Category != "image_inspection" || !class.Retryable || class.Scope != "model" {
+		t.Fatalf("unexpected image-inspection class: %+v", class)
+	}
+	if class := classifyFailure(http.StatusBadRequest, `{"error":"invalid image format"}`); class.Category != "request" || class.Retryable {
+		t.Fatalf("ordinary HTTP 400 must not be retried: %+v", class)
+	}
 	if got := parseRetryAfter("12"); got != 12*time.Second {
 		t.Fatalf("Retry-After duration = %s, want 12s", got)
 	}

@@ -29,6 +29,11 @@ var supportedModels = []string{
 	"sensenova-6.8-flash-lite",
 }
 
+const (
+	defaultImageInspectionRetryLimit     = 2
+	defaultImageInspectionRetryBaseDelay = 750 * time.Millisecond
+)
+
 var hopByHopHeaders = map[string]struct{}{
 	"connection":          {},
 	"content-length":      {},
@@ -79,12 +84,14 @@ type Gateway struct {
 	resolver *ProxyResolver
 	client   *http.Client
 
-	localToken    string
-	upstreamBase  *url.URL
-	maxQueue      time.Duration
-	probeInterval time.Duration
-	startedAt     time.Time
-	stats         gatewayStats
+	localToken                    string
+	upstreamBase                  *url.URL
+	maxQueue                      time.Duration
+	probeInterval                 time.Duration
+	imageInspectionRetryLimit     int
+	imageInspectionRetryBaseDelay time.Duration
+	startedAt                     time.Time
+	stats                         gatewayStats
 
 	mu       sync.RWMutex
 	server   *http.Server
@@ -109,17 +116,19 @@ func NewGateway(
 	transport.MaxIdleConns = 32
 	transport.MaxIdleConnsPerHost = 16
 	return &Gateway{
-		keyStore:      keyStore,
-		pool:          pool,
-		logger:        logger,
-		network:       network,
-		resolver:      resolver,
-		client:        &http.Client{Transport: transport},
-		localToken:    localToken,
-		upstreamBase:  upstreamBase,
-		maxQueue:      10 * time.Minute,
-		probeInterval: 5 * time.Second,
-		startedAt:     time.Now(),
+		keyStore:                      keyStore,
+		pool:                          pool,
+		logger:                        logger,
+		network:                       network,
+		resolver:                      resolver,
+		client:                        &http.Client{Transport: transport},
+		localToken:                    localToken,
+		upstreamBase:                  upstreamBase,
+		maxQueue:                      10 * time.Minute,
+		probeInterval:                 5 * time.Second,
+		imageInspectionRetryLimit:     defaultImageInspectionRetryLimit,
+		imageInspectionRetryBaseDelay: defaultImageInspectionRetryBaseDelay,
+		startedAt:                     time.Now(),
 	}, nil
 }
 
@@ -316,6 +325,7 @@ func (gateway *Gateway) handleChat(response http.ResponseWriter, request *http.R
 	completedSweep := false
 	nextProbeAt := time.Time{}
 	lastCategory := "pool_unavailable"
+	imageInspectionRetries := 0
 
 	for request.Context().Err() == nil {
 		if completedSweep && !nextProbeAt.IsZero() && time.Now().Before(nextProbeAt) {
@@ -448,16 +458,32 @@ func (gateway *Gateway) handleChat(response http.ResponseWriter, request *http.R
 			failureBody = []byte(`{"error":{"message":"Unable to read upstream error response."}}`)
 		}
 		class := classifyFailure(upstream.StatusCode, string(failureBody))
+		retryExhausted := false
+		retryDelay := time.Duration(0)
+		if class.Category == "image_inspection" {
+			if imageInspectionRetries >= gateway.imageInspectionRetryLimit {
+				class.Retryable = false
+				retryExhausted = true
+			} else {
+				imageInspectionRetries++
+				retryDelay = gateway.imageInspectionRetryBaseDelay * time.Duration(1<<(imageInspectionRetries-1))
+			}
+		}
 		if !class.Retryable {
 			gateway.stats.failures.Add(1)
-			gateway.logger.Log("request_rejected", accountLogFields(account, map[string]any{
+			fields := accountLogFields(account, map[string]any{
 				"requestId":  requestID,
 				"model":      model,
 				"status":     upstream.StatusCode,
 				"category":   class.Category,
 				"attempts":   attempts,
 				"durationMs": time.Since(startedAt).Milliseconds(),
-			}))
+			})
+			if class.Category == "image_inspection" {
+				fields["transientRetries"] = imageInspectionRetries
+				fields["retryExhausted"] = retryExhausted
+			}
+			gateway.logger.Log("request_rejected", fields)
 			copyResponseHeaders(response.Header(), upstream.Header)
 			response.Header().Set("X-SenseNova-Pool-Account", account.ID)
 			response.Header().Set("X-SenseNova-Pool-Attempts", strconv.Itoa(attempts))
@@ -478,7 +504,7 @@ func (gateway *Gateway) handleChat(response http.ResponseWriter, request *http.R
 		if class.Category == "auth" {
 			event = "account_quarantined"
 		}
-		gateway.logger.Log(event, accountLogFields(account, map[string]any{
+		fields := accountLogFields(account, map[string]any{
 			"requestId":  requestID,
 			"model":      model,
 			"status":     upstream.StatusCode,
@@ -486,7 +512,16 @@ func (gateway *Gateway) handleChat(response http.ResponseWriter, request *http.R
 			"attempt":    attempts,
 			"cooldownMs": cooldown.Milliseconds(),
 			"durationMs": time.Since(attemptStarted).Milliseconds(),
-		}))
+		})
+		if class.Category == "image_inspection" {
+			fields["transientRetry"] = imageInspectionRetries
+			fields["retryDelayMs"] = retryDelay.Milliseconds()
+		}
+		gateway.logger.Log(event, fields)
+		if retryDelay > 0 && !sleepContext(request.Context(), retryDelay) {
+			gateway.stats.canceled.Add(1)
+			return
+		}
 		if completedSweep {
 			nextProbeAt = time.Now().Add(gateway.probeInterval)
 			gateway.stats.pacedProbes.Add(1)
